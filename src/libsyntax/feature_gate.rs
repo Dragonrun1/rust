@@ -28,8 +28,8 @@ use self::AttributeGate::*;
 use rustc_target::spec::abi::Abi;
 use ast::{self, NodeId, PatKind, RangeEnd};
 use attr;
-use edition::{ALL_EDITIONS, Edition};
 use codemap::Spanned;
+use edition::{ALL_EDITIONS, Edition};
 use syntax_pos::{Span, DUMMY_SP};
 use errors::{DiagnosticBuilder, Handler, FatalError};
 use visit::{self, FnKind, Visitor};
@@ -309,7 +309,7 @@ declare_features! (
     // Declarative macros 2.0 (`macro`).
     (active, decl_macro, "1.17.0", Some(39412), None),
 
-    // Allows #[link(kind="static-nobundle"...]
+    // Allows #[link(kind="static-nobundle"...)]
     (active, static_nobundle, "1.16.0", Some(37403), None),
 
     // `extern "msp430-interrupt" fn()`
@@ -399,9 +399,6 @@ declare_features! (
     // `extern` in paths
     (active, extern_in_paths, "1.23.0", Some(44660), None),
 
-    // Allows `#[repr(transparent)]` attribute on newtype structs
-    (active, repr_transparent, "1.25.0", Some(43036), None),
-
     // Use `?` as the Kleene "at most one" operator
     (active, macro_at_most_once_rep, "1.25.0", Some(48075), None),
 
@@ -424,7 +421,7 @@ declare_features! (
     (active, wasm_custom_section, "1.26.0", Some(51088), None),
 
     // The #![wasm_import_module] attribute
-    (active, wasm_import_module, "1.26.0", Some(51088), None),
+    (active, wasm_import_module, "1.26.0", Some(52090), None),
 
     // Allows keywords to be escaped for use as identifiers
     (active, raw_identifiers, "1.26.0", Some(48589), None),
@@ -461,6 +458,11 @@ declare_features! (
 
     // Scoped attributes
     (active, tool_attributes, "1.25.0", Some(44690), None),
+    // Scoped lints
+    (active, tool_lints, "1.28.0", Some(44690), None),
+
+    // allow irrefutable patterns in if-let and while-let statements (RFC 2086)
+    (active, irrefutable_let_patterns, "1.27.0", Some(44495), None),
 
     // Allows use of the :literal macro fragment specifier (RFC 1576)
     (active, macro_literal_matcher, "1.27.0", Some(35625), None),
@@ -471,12 +473,19 @@ declare_features! (
     // 'a: { break 'a; }
     (active, label_break_value, "1.28.0", Some(48594), None),
 
-
     // #[panic_implementation]
     (active, panic_implementation, "1.28.0", Some(44489), None),
 
     // #[doc(keyword = "...")]
     (active, doc_keyword, "1.28.0", Some(51315), None),
+
+    // Allows async and await syntax
+    (active, async_await, "1.28.0", Some(50547), None),
+
+    // #[alloc_error_handler]
+    (active, alloc_error_handler, "1.29.0", Some(51540), None),
+
+    (active, abi_amdgpu_kernel, "1.29.0", Some(51575), None),
 );
 
 declare_features! (
@@ -615,13 +624,15 @@ declare_features! (
     (accepted, termination_trait_test, "1.27.0", Some(48854), None),
     // The #[global_allocator] attribute
     (accepted, global_allocator, "1.28.0", Some(27389), None),
+    // Allows `#[repr(transparent)]` attribute on newtype structs
+    (accepted, repr_transparent, "1.28.0", Some(43036), None),
 );
 
 // If you change this, please modify src/doc/unstable-book as well. You must
 // move that documentation into the relevant place in the other docs, and
 // remove the chapter on the flag.
 
-#[derive(PartialEq, Copy, Clone, Debug)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub enum AttributeType {
     /// Normal, builtin attribute that is consumed
     /// by the compiler before the unused_attribute check
@@ -654,7 +665,7 @@ impl AttributeGate {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub enum Stability {
     Unstable,
     // Argument is tracking issue link.
@@ -1077,6 +1088,11 @@ pub const BUILTIN_ATTRIBUTES: &'static [(&'static str, AttributeType, AttributeG
                            "#[panic_implementation] is an unstable feature",
                            cfg_fn!(panic_implementation))),
 
+    ("alloc_error_handler", Normal, Gated(Stability::Unstable,
+                           "alloc_error_handler",
+                           "#[alloc_error_handler] is an unstable feature",
+                           cfg_fn!(alloc_error_handler))),
+
     // Crate level attributes
     ("crate_name", CrateLevel, Ungated),
     ("crate_type", CrateLevel, Ungated),
@@ -1097,7 +1113,7 @@ const GATED_CFGS: &[(&str, &str, fn(&Features) -> bool)] = &[
     ("target_has_atomic", "cfg_target_has_atomic", cfg_fn!(cfg_target_has_atomic)),
 ];
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct GatedCfg {
     span: Span,
     index: usize,
@@ -1256,7 +1272,7 @@ pub enum GateIssue {
     Library(Option<u32>)
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum GateStrength {
     /// A hard error. (Most feature gates should use this.)
     Hard,
@@ -1355,17 +1371,17 @@ pub const EXPLAIN_LITERAL_MATCHER: &'static str =
     ":literal fragment specifier is experimental and subject to change";
 
 pub const EXPLAIN_UNSIZED_TUPLE_COERCION: &'static str =
-    "Unsized tuple coercion is not stable enough for use and is subject to change";
+    "unsized tuple coercion is not stable enough for use and is subject to change";
 
 pub const EXPLAIN_MACRO_AT_MOST_ONCE_REP: &'static str =
-    "Using the `?` macro Kleene operator for \"at most one\" repetition is unstable";
+    "using the `?` macro Kleene operator for \"at most one\" repetition is unstable";
 
 pub const EXPLAIN_MACROS_IN_EXTERN: &'static str =
-    "Macro invocations in `extern {}` blocks are experimental.";
+    "macro invocations in `extern {}` blocks are experimental.";
 
 // mention proc-macros when enabled
 pub const EXPLAIN_PROC_MACROS_IN_EXTERN: &'static str =
-    "Macro and proc-macro invocations in `extern {}` blocks are experimental.";
+    "macro and proc-macro invocations in `extern {}` blocks are experimental.";
 
 struct PostExpansionVisitor<'a> {
     context: &'a Context<'a>,
@@ -1424,6 +1440,10 @@ impl<'a> PostExpansionVisitor<'a> {
             Abi::X86Interrupt => {
                 gate_feature_post!(&self, abi_x86_interrupt, span,
                                    "x86-interrupt ABI is experimental and subject to change");
+            },
+            Abi::AmdGpuKernel => {
+                gate_feature_post!(&self, abi_amdgpu_kernel, span,
+                                   "amdgpu-kernel ABI is experimental and subject to change");
             },
             // Stable
             Abi::Cdecl |
@@ -1546,7 +1566,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
     }
 
     fn visit_use_tree(&mut self, use_tree: &'a ast::UseTree, id: NodeId, _nested: bool) {
-        if let ast::UseTreeKind::Simple(Some(ident)) = use_tree.kind {
+        if let ast::UseTreeKind::Simple(Some(ident), ..) = use_tree.kind {
             if ident.name == "_" {
                 gate_feature_post!(&self, underscore_imports, use_tree.span,
                                    "renaming imports with `_` is unstable");
@@ -1594,11 +1614,6 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                         if item.check_name("simd") {
                             gate_feature_post!(&self, repr_simd, attr.span,
                                                "SIMD types are experimental and possibly buggy");
-                        }
-                        if item.check_name("transparent") {
-                            gate_feature_post!(&self, repr_transparent, attr.span,
-                                               "the `#[repr(transparent)]` attribute \
-                                               is experimental");
                         }
                         if let Some((name, _)) = item.name_value_literal() {
                             if name == "packed" {
@@ -1689,7 +1704,9 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
 
     fn visit_fn_ret_ty(&mut self, ret_ty: &'a ast::FunctionRetTy) {
         if let ast::FunctionRetTy::Ty(ref output_ty) = *ret_ty {
-            if output_ty.node != ast::TyKind::Never {
+            if let ast::TyKind::Never = output_ty.node {
+                // Do nothing
+            } else {
                 self.visit_ty(output_ty)
             }
         }
@@ -1727,6 +1744,12 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                                     "labels on blocks are unstable");
                 }
             }
+            ast::ExprKind::Closure(_, ast::IsAsync::Async { .. }, ..) => {
+                gate_feature_post!(&self, async_await, e.span, "async closures are unstable");
+            }
+            ast::ExprKind::Async(..) => {
+                gate_feature_post!(&self, async_await, e.span, "async blocks are unstable");
+            }
             _ => {}
         }
         visit::walk_expr(self, e);
@@ -1748,7 +1771,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                                   pattern.span,
                                   "box pattern syntax is experimental");
             }
-            PatKind::Range(_, _, RangeEnd::Excluded) => {
+            PatKind::Range(_, _, Spanned { node: RangeEnd::Excluded, .. }) => {
                 gate_feature_post!(&self, exclusive_range_pattern, pattern.span,
                                    "exclusive range pattern syntax is experimental");
             }
@@ -1766,20 +1789,24 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                 fn_decl: &'a ast::FnDecl,
                 span: Span,
                 _node_id: NodeId) {
-        // check for const fn declarations
-        if let FnKind::ItemFn(_, _, Spanned { node: ast::Constness::Const, .. }, _, _, _) =
-            fn_kind {
-            gate_feature_post!(&self, const_fn, span, "const fn is unstable");
-        }
-        // stability of const fn methods are covered in
-        // visit_trait_item and visit_impl_item below; this is
-        // because default methods don't pass through this
-        // point.
-
         match fn_kind {
-            FnKind::ItemFn(_, _, _, abi, _, _) |
-            FnKind::Method(_, &ast::MethodSig { abi, .. }, _, _) => {
-                self.check_abi(abi, span);
+            FnKind::ItemFn(_, header, _, _) => {
+                // check for const fn and async fn declarations
+                if header.asyncness.is_async() {
+                    gate_feature_post!(&self, async_await, span, "async fn is unstable");
+                }
+                if header.constness.node == ast::Constness::Const {
+                    gate_feature_post!(&self, const_fn, span, "const fn is unstable");
+                }
+                // stability of const fn methods are covered in
+                // visit_trait_item and visit_impl_item below; this is
+                // because default methods don't pass through this
+                // point.
+
+                self.check_abi(header.abi, span);
+            }
+            FnKind::Method(_, sig, _, _) => {
+                self.check_abi(sig.header.abi, span);
             }
             _ => {}
         }
@@ -1790,9 +1817,9 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         match ti.node {
             ast::TraitItemKind::Method(ref sig, ref block) => {
                 if block.is_none() {
-                    self.check_abi(sig.abi, ti.span);
+                    self.check_abi(sig.header.abi, ti.span);
                 }
-                if sig.constness.node == ast::Constness::Const {
+                if sig.header.constness.node == ast::Constness::Const {
                     gate_feature_post!(&self, const_fn, ti.span, "const fn is unstable");
                 }
             }
@@ -1803,7 +1830,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                     gate_feature_post!(&self, associated_type_defaults, ti.span,
                                        "associated type defaults are unstable");
                 }
-                if ti.generics.is_parameterized() {
+                if !ti.generics.params.is_empty() {
                     gate_feature_post!(&self, generic_associated_types, ti.span,
                                        "generic associated types are unstable");
                 }
@@ -1826,11 +1853,11 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
 
         match ii.node {
             ast::ImplItemKind::Method(ref sig, _) => {
-                if sig.constness.node == ast::Constness::Const {
+                if sig.header.constness.node == ast::Constness::Const {
                     gate_feature_post!(&self, const_fn, ii.span, "const fn is unstable");
                 }
             }
-            ast::ImplItemKind::Type(_) if ii.generics.is_parameterized() => {
+            ast::ImplItemKind::Type(_) if !ii.generics.params.is_empty() => {
                 gate_feature_post!(&self, generic_associated_types, ii.span,
                                    "generic associated types are unstable");
             }
@@ -2021,7 +2048,7 @@ pub fn check_crate(krate: &ast::Crate,
     visit::walk_crate(visitor, krate);
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Hash)]
 pub enum UnstableFeatures {
     /// Hard errors for unstable features are active, as on
     /// beta/stable channels.

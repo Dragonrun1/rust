@@ -17,7 +17,7 @@ use rustc::middle::cstore::CrateStore;
 use rustc::middle::privacy::AccessLevels;
 use rustc::ty::{self, TyCtxt, AllArenas};
 use rustc::hir::map as hir_map;
-use rustc::lint;
+use rustc::lint::{self, LintPass};
 use rustc::session::config::ErrorOutputType;
 use rustc::util::nodemap::{FxHashMap, FxHashSet};
 use rustc_resolve as resolve;
@@ -77,7 +77,7 @@ pub struct DocContext<'a, 'tcx: 'a, 'rcx: 'a> {
     /// Table node id of lifetime parameter definition -> substituted lifetime
     pub lt_substs: RefCell<FxHashMap<DefId, clean::Lifetime>>,
     /// Table DefId of `impl Trait` in argument position -> bounds
-    pub impl_trait_bounds: RefCell<FxHashMap<DefId, Vec<clean::TyParamBound>>>,
+    pub impl_trait_bounds: RefCell<FxHashMap<DefId, Vec<clean::GenericBound>>>,
     pub send_trait: Option<DefId>,
     pub fake_def_ids: RefCell<FxHashMap<CrateNum, DefId>>,
     pub all_fake_def_ids: RefCell<FxHashSet<DefId>>,
@@ -178,7 +178,10 @@ pub fn run_core(search_paths: SearchPaths,
                 force_unstable_if_unmarked: bool,
                 edition: Edition,
                 cg: CodegenOptions,
-                error_format: ErrorOutputType) -> (clean::Crate, RenderInfo)
+                error_format: ErrorOutputType,
+                cmd_lints: Vec<(String, lint::Level)>,
+                lint_cap: Option<lint::Level>,
+                describe_lints: bool) -> (clean::Crate, RenderInfo)
 {
     // Parse, resolve, and typecheck the given crate.
 
@@ -187,7 +190,33 @@ pub fn run_core(search_paths: SearchPaths,
         _ => None
     };
 
-    let warning_lint = lint::builtin::WARNINGS.name_lower();
+    let intra_link_resolution_failure_name = lint::builtin::INTRA_DOC_LINK_RESOLUTION_FAILURE.name;
+    let warnings_lint_name = lint::builtin::WARNINGS.name;
+    let missing_docs = rustc_lint::builtin::MISSING_DOCS.name;
+
+    // In addition to those specific lints, we also need to whitelist those given through
+    // command line, otherwise they'll get ignored and we don't want that.
+    let mut whitelisted_lints = vec![warnings_lint_name.to_owned(),
+                                     intra_link_resolution_failure_name.to_owned(),
+                                     missing_docs.to_owned()];
+
+    for (lint, _) in &cmd_lints {
+        whitelisted_lints.push(lint.clone());
+    }
+
+    let lints = lint::builtin::HardwiredLints.get_lints()
+                    .into_iter()
+                    .chain(rustc_lint::SoftLints.get_lints().into_iter())
+                    .filter_map(|lint| {
+                        if lint.name == warnings_lint_name ||
+                           lint.name == intra_link_resolution_failure_name {
+                            None
+                        } else {
+                            Some((lint.name_lower(), lint::Allow))
+                        }
+                    })
+                    .chain(cmd_lints.into_iter())
+                    .collect::<Vec<_>>();
 
     let host_triple = TargetTriple::from_triple(config::host_triple());
     // plays with error output here!
@@ -195,8 +224,12 @@ pub fn run_core(search_paths: SearchPaths,
         maybe_sysroot,
         search_paths,
         crate_types: vec![config::CrateTypeRlib],
-        lint_opts: if !allow_warnings { vec![(warning_lint, lint::Allow)] } else { vec![] },
-        lint_cap: Some(lint::Allow),
+        lint_opts: if !allow_warnings {
+            lints
+        } else {
+            vec![]
+        },
+        lint_cap: Some(lint_cap.unwrap_or_else(|| lint::Forbid)),
         cg,
         externs,
         target_triple: triple.unwrap_or(host_triple),
@@ -209,6 +242,7 @@ pub fn run_core(search_paths: SearchPaths,
         },
         error_format,
         edition,
+        describe_lints,
         ..config::basic_options()
     };
     driver::spawn_thread_pool(sessopts, move |sessopts| {
@@ -218,6 +252,24 @@ pub fn run_core(search_paths: SearchPaths,
         let mut sess = session::build_session_(
             sessopts, cpath, diagnostic_handler, codemap,
         );
+
+        lint::builtin::HardwiredLints.get_lints()
+                                     .into_iter()
+                                     .chain(rustc_lint::SoftLints.get_lints().into_iter())
+                                     .filter_map(|lint| {
+                                         // We don't want to whitelist *all* lints so let's
+                                         // ignore those ones.
+                                         if whitelisted_lints.iter().any(|l| &lint.name == l) {
+                                             None
+                                         } else {
+                                             Some(lint)
+                                         }
+                                     })
+                                     .for_each(|l| {
+                                         sess.driver_lint_caps.insert(lint::LintId::of(l),
+                                                                      lint::Allow);
+                                     });
+
         let codegen_backend = rustc_driver::get_codegen_backend(&sess);
         let cstore = Rc::new(CStore::new(codegen_backend.metadata_loader()));
         rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
@@ -282,7 +334,6 @@ pub fn run_core(search_paths: SearchPaths,
                                                             &sess);
 
         let resolver = RefCell::new(resolver);
-
         abort_on_err(driver::phase_3_run_analysis_passes(&*codegen_backend,
                                                         control,
                                                         &sess,

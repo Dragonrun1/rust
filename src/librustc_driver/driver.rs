@@ -87,7 +87,7 @@ pub fn spawn_thread_pool<F: FnOnce(config::Options) -> R + sync::Send, R: sync::
 
     let config = ThreadPoolBuilder::new()
         .num_threads(Session::query_threads_from_opts(&opts))
-        .deadlock_handler(|| unsafe { ty::maps::handle_deadlock() })
+        .deadlock_handler(|| unsafe { ty::query::handle_deadlock() })
         .stack_size(16 * 1024 * 1024);
 
     let with_pool = move |pool: &ThreadPool| {
@@ -399,10 +399,10 @@ pub struct CompileController<'a> {
 
     /// Allows overriding default rustc query providers,
     /// after `default_provide` has installed them.
-    pub provide: Box<Fn(&mut ty::maps::Providers) + 'a>,
+    pub provide: Box<Fn(&mut ty::query::Providers) + 'a>,
     /// Same as `provide`, but only for non-local crates,
     /// applied after `default_provide_extern`.
-    pub provide_extern: Box<Fn(&mut ty::maps::Providers) + 'a>,
+    pub provide_extern: Box<Fn(&mut ty::query::Providers) + 'a>,
 }
 
 impl<'a> CompileController<'a> {
@@ -1051,9 +1051,18 @@ where
         });
     }
 
+    // Expand global allocators, which are treated as an in-tree proc macro
     krate = time(sess, "creating allocators", || {
-        allocator::expand::modify(&sess.parse_sess, &mut resolver, krate, sess.diagnostic())
+        allocator::expand::modify(
+            &sess.parse_sess,
+            &mut resolver,
+            krate,
+            crate_name.to_string(),
+            sess.diagnostic(),
+        )
     });
+
+    // Done with macro expansion!
 
     after_expand(&krate)?;
 
@@ -1140,7 +1149,7 @@ where
     })
 }
 
-pub fn default_provide(providers: &mut ty::maps::Providers) {
+pub fn default_provide(providers: &mut ty::query::Providers) {
     hir::provide(providers);
     borrowck::provide(providers);
     mir::provide(providers);
@@ -1158,7 +1167,7 @@ pub fn default_provide(providers: &mut ty::maps::Providers) {
     lint::provide(providers);
 }
 
-pub fn default_provide_extern(providers: &mut ty::maps::Providers) {
+pub fn default_provide_extern(providers: &mut ty::query::Providers) {
     cstore::provide_extern(providers);
 }
 
@@ -1203,7 +1212,7 @@ where
 
     time(sess, "loop checking", || loops::check_crate(sess, &hir_map));
 
-    let mut local_providers = ty::maps::Providers::default();
+    let mut local_providers = ty::query::Providers::default();
     default_provide(&mut local_providers);
     codegen_backend.provide(&mut local_providers);
     (control.provide)(&mut local_providers);
@@ -1270,13 +1279,15 @@ where
                 middle::liveness::check_crate(tcx)
             });
 
-            time(sess, "borrow checking", || borrowck::check_crate(tcx));
-
-            time(sess, "MIR borrow checking", || {
-                for def_id in tcx.body_owners() {
-                    tcx.mir_borrowck(def_id);
+            time(sess, "borrow checking", || {
+                if tcx.use_ast_borrowck() {
+                    borrowck::check_crate(tcx);
                 }
             });
+
+            time(sess,
+                 "MIR borrow checking",
+                 || tcx.par_body_owners(|def_id| { tcx.mir_borrowck(def_id); }));
 
             time(sess, "dumping chalk-like clauses", || {
                 rustc_traits::lowering::dump_program_clauses(tcx);

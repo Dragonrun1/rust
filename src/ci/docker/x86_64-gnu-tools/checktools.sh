@@ -79,11 +79,11 @@ status_check() {
     check_dispatch $1 beta nomicon src/doc/nomicon
     check_dispatch $1 beta reference src/doc/reference
     check_dispatch $1 beta rust-by-example src/doc/rust-by-example
-    check_dispatch $1 beta rls src/tool/rls
-    check_dispatch $1 beta rustfmt src/tool/rustfmt
+    check_dispatch $1 beta rls src/tools/rls
+    check_dispatch $1 beta rustfmt src/tools/rustfmt
     # these tools are not required for beta to successfully branch
-    check_dispatch $1 nightly clippy-driver src/tool/clippy
-    check_dispatch $1 nightly miri src/tool/miri
+    check_dispatch $1 nightly clippy-driver src/tools/clippy
+    check_dispatch $1 nightly miri src/tools/miri
 }
 
 # If this PR is intended to update one of these tools, do not let the build pass
@@ -91,7 +91,7 @@ status_check() {
 
 status_check "submodule_changed"
 
-CHECK_NOT="$(dirname $0)/checkregression.py"
+CHECK_NOT="$(readlink -f "$(dirname $0)/checkregression.py")"
 change_toolstate() {
     # only update the history
     if python2.7 "$CHECK_NOT" "$OS" "$TOOLSTATE_FILE" "_data/latest.json" changed; then

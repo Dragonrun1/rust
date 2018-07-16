@@ -105,7 +105,10 @@ use rustc::hir::{self, PatKind};
 
 // a variation on try that just returns unit
 macro_rules! ignore_err {
-    ($e:expr) => (match $e { Ok(e) => e, Err(_) => return () })
+    ($e:expr) => (match $e { Ok(e) => e, Err(_) => {
+        debug!("ignoring mem-categorization error!");
+        return ()
+    }})
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -1018,7 +1021,7 @@ impl<'a, 'gcx, 'tcx> RegionCtxt<'a, 'gcx, 'tcx> {
             let arg_ty = self.node_ty(arg.hir_id);
             let re_scope = self.tcx.mk_region(ty::ReScope(body_scope));
             let arg_cmt = self.with_mc(|mc| {
-                Rc::new(mc.cat_rvalue(arg.id, arg.pat.span, re_scope, arg_ty))
+                Rc::new(mc.cat_rvalue(arg.hir_id, arg.pat.span, re_scope, arg_ty))
             });
             debug!("arg_ty={:?} arg_cmt={:?} arg={:?}",
                    arg_ty,
@@ -1034,22 +1037,24 @@ impl<'a, 'gcx, 'tcx> RegionCtxt<'a, 'gcx, 'tcx> {
         debug!("link_pattern(discr_cmt={:?}, root_pat={:?})",
                discr_cmt,
                root_pat);
-        let _ = self.with_mc(|mc| {
+        ignore_err!(self.with_mc(|mc| {
             mc.cat_pattern(discr_cmt, root_pat, |sub_cmt, sub_pat| {
                 match sub_pat.node {
                     // `ref x` pattern
                     PatKind::Binding(..) => {
-                        let bm = *mc.tables.pat_binding_modes().get(sub_pat.hir_id)
-                                                               .expect("missing binding mode");
-                        if let ty::BindByReference(mutbl) = bm {
-                            self.link_region_from_node_type(sub_pat.span, sub_pat.hir_id,
-                                                            mutbl, &sub_cmt);
+                        if let Some(&bm) = mc.tables.pat_binding_modes().get(sub_pat.hir_id) {
+                            if let ty::BindByReference(mutbl) = bm {
+                                self.link_region_from_node_type(sub_pat.span, sub_pat.hir_id,
+                                                                mutbl, &sub_cmt);
+                            }
+                        } else {
+                            self.tcx.sess.delay_span_bug(sub_pat.span, "missing binding mode");
                         }
                     }
                     _ => {}
                 }
             })
-        });
+        }));
     }
 
     /// Link lifetime of borrowed pointer resulting from autoref to lifetimes in the value being

@@ -281,6 +281,12 @@ declare_lint! {
 }
 
 declare_lint! {
+    pub IRREFUTABLE_LET_PATTERNS,
+    Deny,
+    "detects irrefutable patterns in if-let and while-let statements"
+}
+
+declare_lint! {
     pub UNUSED_LABELS,
     Allow,
     "detects labels that are never used"
@@ -296,6 +302,31 @@ declare_lint! {
     pub DUPLICATE_MACRO_EXPORTS,
     Deny,
     "detects duplicate macro exports"
+}
+
+declare_lint! {
+    pub INTRA_DOC_LINK_RESOLUTION_FAILURE,
+    Warn,
+    "warn about documentation intra links resolution failure"
+}
+
+declare_lint! {
+    pub WHERE_CLAUSES_OBJECT_SAFETY,
+    Warn,
+    "checks the object safety of where clauses"
+}
+
+declare_lint! {
+    pub PROC_MACRO_DERIVE_RESOLUTION_FALLBACK,
+    Warn,
+    "detects proc macro derives using inaccessible names from parent modules"
+}
+
+declare_lint! {
+    pub MACRO_USE_EXTERN_CRATE,
+    Allow,
+    "the `#[macro_use]` attribute is now deprecated in favor of using macros \
+     via the module system"
 }
 
 /// Does nothing as a lint pass, but registers some `Lint`s
@@ -349,8 +380,13 @@ impl LintPass for HardwiredLints {
             BARE_TRAIT_OBJECTS,
             ABSOLUTE_PATHS_NOT_STARTING_WITH_CRATE,
             UNSTABLE_NAME_COLLISIONS,
+            IRREFUTABLE_LET_PATTERNS,
             DUPLICATE_ASSOCIATED_TYPE_BINDINGS,
             DUPLICATE_MACRO_EXPORTS,
+            INTRA_DOC_LINK_RESOLUTION_FAILURE,
+            WHERE_CLAUSES_OBJECT_SAFETY,
+            PROC_MACRO_DERIVE_RESOLUTION_FALLBACK,
+            MACRO_USE_EXTERN_CRATE,
         )
     }
 }
@@ -363,6 +399,7 @@ pub enum BuiltinLintDiagnostics {
     BareTraitObject(Span, /* is_global */ bool),
     AbsPathWithModule(Span),
     DuplicatedMacroExports(ast::Ident, Span, Span),
+    ProcMacroDeriveResolutionFallback(Span),
 }
 
 impl BuiltinLintDiagnostics {
@@ -398,6 +435,10 @@ impl BuiltinLintDiagnostics {
             BuiltinLintDiagnostics::DuplicatedMacroExports(ident, earlier_span, later_span) => {
                 db.span_label(later_span, format!("`{}` already exported", ident));
                 db.span_note(earlier_span, "previous macro export is now shadowed");
+            }
+            BuiltinLintDiagnostics::ProcMacroDeriveResolutionFallback(span) => {
+                db.span_label(span, "names from parent modules are not \
+                                     accessible without an explicit import");
             }
         }
     }

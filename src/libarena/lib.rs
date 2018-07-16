@@ -26,9 +26,11 @@
 #![feature(alloc)]
 #![feature(core_intrinsics)]
 #![feature(dropck_eyepatch)]
+#![feature(raw_vec_internals)]
 #![cfg_attr(test, feature(test))]
 
 #![allow(deprecated)]
+#![deny(bare_trait_objects)]
 
 extern crate alloc;
 extern crate rustc_data_structures;

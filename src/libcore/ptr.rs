@@ -1243,25 +1243,12 @@ impl<T: ?Sized> *const T {
     /// # } }
     /// ```
     #[unstable(feature = "align_offset", issue = "44488")]
-    #[cfg(not(stage0))]
     pub fn align_offset(self, align: usize) -> usize where T: Sized {
         if !align.is_power_of_two() {
             panic!("align_offset: align is not a power-of-two");
         }
         unsafe {
             align_offset(self, align)
-        }
-    }
-
-    /// definitely docs.
-    #[unstable(feature = "align_offset", issue = "44488")]
-    #[cfg(stage0)]
-    pub fn align_offset(self, align: usize) -> usize where T: Sized {
-        if !align.is_power_of_two() {
-            panic!("align_offset: align is not a power-of-two");
-        }
-        unsafe {
-            intrinsics::align_offset(self as *const (), align)
         }
     }
 }
@@ -2308,25 +2295,12 @@ impl<T: ?Sized> *mut T {
     /// # } }
     /// ```
     #[unstable(feature = "align_offset", issue = "44488")]
-    #[cfg(not(stage0))]
     pub fn align_offset(self, align: usize) -> usize where T: Sized {
         if !align.is_power_of_two() {
             panic!("align_offset: align is not a power-of-two");
         }
         unsafe {
             align_offset(self, align)
-        }
-    }
-
-    /// definitely docs.
-    #[unstable(feature = "align_offset", issue = "44488")]
-    #[cfg(stage0)]
-    pub fn align_offset(self, align: usize) -> usize where T: Sized {
-        if !align.is_power_of_two() {
-            panic!("align_offset: align is not a power-of-two");
-        }
-        unsafe {
-            intrinsics::align_offset(self as *const (), align)
         }
     }
 }
@@ -2346,7 +2320,6 @@ impl<T: ?Sized> *mut T {
 ///
 /// Any questions go to @nagisa.
 #[lang="align_offset"]
-#[cfg(not(stage0))]
 pub(crate) unsafe fn align_offset<T: Sized>(p: *const T, a: usize) -> usize {
     /// Calculate multiplicative modular inverse of `x` modulo `m`.
     ///
@@ -2692,6 +2665,7 @@ impl<T: ?Sized> PartialOrd for *mut T {
            reason = "use NonNull instead and consider PhantomData<T> \
                      (if you also use #[may_dangle]), Send, and/or Sync")]
 #[doc(hidden)]
+#[repr(transparent)]
 pub struct Unique<T: ?Sized> {
     pointer: NonZero<*const T>,
     // NOTE: this marker has no consequences for variance, but is necessary
@@ -2840,6 +2814,7 @@ impl<'a, T: ?Sized> From<NonNull<T>> for Unique<T> {
 /// such as Box, Rc, Arc, Vec, and LinkedList. This is the case because they
 /// provide a public API that follows the normal shared XOR mutable rules of Rust.
 #[stable(feature = "nonnull", since = "1.25.0")]
+#[repr(transparent)]
 pub struct NonNull<T: ?Sized> {
     pointer: NonZero<*const T>,
 }

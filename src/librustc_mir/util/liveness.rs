@@ -37,6 +37,7 @@ use rustc::mir::*;
 use rustc::mir::visit::{PlaceContext, Visitor};
 use rustc_data_structures::indexed_vec::{Idx, IndexVec};
 use rustc_data_structures::indexed_set::IdxSetBuf;
+use rustc_data_structures::work_queue::WorkQueue;
 use util::pretty::{dump_enabled, write_basic_block, write_mir_intro};
 use rustc::ty::item_path;
 use rustc::mir::visit::MirVisitable;
@@ -54,9 +55,6 @@ pub type LocalSet = IdxSetBuf<Local>;
 pub struct LivenessResult {
     /// Liveness mode in use when these results were computed.
     pub mode: LivenessMode,
-
-    /// Live variables on entry to each basic block.
-    pub ins: IndexVec<BasicBlock, LocalSet>,
 
     /// Live variables on exit to each basic block. This is equal to
     /// the union of the `ins` for each successor.
@@ -124,37 +122,38 @@ pub fn liveness_of_locals<'tcx>(mir: &Mir<'tcx>, mode: LivenessMode) -> Liveness
         .map(|b| block(mode, b, locals))
         .collect();
 
-    let mut ins: IndexVec<_, _> = mir.basic_blocks()
+    let mut outs: IndexVec<_, _> = mir.basic_blocks()
         .indices()
         .map(|_| LocalSet::new_empty(locals))
         .collect();
-    let mut outs = ins.clone();
 
-    let mut changed = true;
     let mut bits = LocalSet::new_empty(locals);
-    while changed {
-        changed = false;
 
-        for b in mir.basic_blocks().indices().rev() {
-            // outs[b] = ∪ {ins of successors}
-            bits.clear();
-            for &successor in mir.basic_blocks()[b].terminator().successors() {
-                bits.union(&ins[successor]);
-            }
-            outs[b].clone_from(&bits);
+    // queue of things that need to be re-processed, and a set containing
+    // the things currently in the queue
+    let mut dirty_queue: WorkQueue<BasicBlock> = WorkQueue::with_all(mir.basic_blocks().len());
 
-            // bits = use ∪ (bits - def)
-            def_use[b].apply(&mut bits);
+    let predecessors = mir.predecessors();
 
-            // update bits on entry and flag if they have changed
-            if ins[b] != bits {
-                ins[b].clone_from(&bits);
-                changed = true;
+    while let Some(bb) = dirty_queue.pop() {
+        // bits = use ∪ (bits - def)
+        bits.overwrite(&outs[bb]);
+        def_use[bb].apply(&mut bits);
+
+        // `bits` now contains the live variables on entry. Therefore,
+        // add `bits` to the `out` set for each predecessor; if those
+        // bits were not already present, then enqueue the predecessor
+        // as dirty.
+        //
+        // (note that `union` returns true if the `self` set changed)
+        for &pred_bb in &predecessors[bb] {
+            if outs[pred_bb].union(&bits) {
+                dirty_queue.insert(pred_bb);
             }
         }
     }
 
-    LivenessResult { mode, ins, outs }
+    LivenessResult { mode, outs }
 }
 
 impl LivenessResult {
@@ -180,29 +179,6 @@ impl LivenessResult {
             block,
             statement_index,
         };
-        let terminator_defs_uses = self.defs_uses(mir, terminator_location, &data.terminator);
-        terminator_defs_uses.apply(&mut bits);
-        callback(terminator_location, &bits);
-
-        // Compute liveness before each statement (in rev order) and invoke callback.
-        for statement in data.statements.iter().rev() {
-            statement_index -= 1;
-            let statement_location = Location {
-                block,
-                statement_index,
-            };
-            let statement_defs_uses = self.defs_uses(mir, statement_location, statement);
-            statement_defs_uses.apply(&mut bits);
-            callback(statement_location, &bits);
-        }
-
-        assert_eq!(bits, self.ins[block]);
-    }
-
-    fn defs_uses<'tcx, V>(&self, mir: &Mir<'tcx>, location: Location, thing: &V) -> DefsUses
-    where
-        V: MirVisitable<'tcx>,
-    {
         let locals = mir.local_decls.len();
         let mut visitor = DefsUsesVisitor {
             mode: self.mode,
@@ -211,12 +187,22 @@ impl LivenessResult {
                 uses: LocalSet::new_empty(locals),
             },
         };
-
         // Visit the various parts of the basic block in reverse. If we go
         // forward, the logic in `add_def` and `add_use` would be wrong.
-        thing.apply(location, &mut visitor);
+        visitor.update_bits_and_do_callback(terminator_location, &data.terminator, &mut bits,
+                                            &mut callback);
 
-        visitor.defs_uses
+        // Compute liveness before each statement (in rev order) and invoke callback.
+        for statement in data.statements.iter().rev() {
+            statement_index -= 1;
+            let statement_location = Location {
+                block,
+                statement_index,
+            };
+            visitor.defs_uses.clear();
+            visitor.update_bits_and_do_callback(statement_location, statement, &mut bits,
+                                                &mut callback);
+        }
     }
 }
 
@@ -307,6 +293,11 @@ struct DefsUses {
 }
 
 impl DefsUses {
+    fn clear(&mut self) {
+        self.uses.clear();
+        self.defs.clear();
+    }
+
     fn apply(&self, bits: &mut LocalSet) -> bool {
         bits.subtract(&self.defs) | bits.union(&self.uses)
     }
@@ -338,6 +329,22 @@ impl DefsUses {
         //     use(X)
         self.defs.remove(&index);
         self.uses.add(&index);
+    }
+}
+
+impl DefsUsesVisitor {
+    /// Update `bits` with the effects of `value` and call `callback`. We
+    /// should always visit in reverse order. This method assumes that we have
+    /// not visited anything before; if you have, clear `bits` first.
+    fn update_bits_and_do_callback<'tcx, OP>(&mut self, location: Location,
+                                             value: &impl MirVisitable<'tcx>, bits: &mut LocalSet,
+                                             callback: &mut OP)
+    where
+        OP: FnMut(Location, &LocalSet),
+    {
+        value.apply(location, self);
+        self.defs_uses.apply(bits);
+        callback(location, bits);
     }
 }
 
@@ -438,7 +445,6 @@ pub fn write_mir_fn<'a, 'tcx>(
                 .collect();
             writeln!(w, "{} {{{}}}", prefix, live.join(", "))
         };
-        print(w, "   ", &result.ins)?;
         write_basic_block(tcx, block, mir, &mut |_, _| Ok(()), w)?;
         print(w, "   ", &result.outs)?;
         if block.index() + 1 != mir.basic_blocks().len() {

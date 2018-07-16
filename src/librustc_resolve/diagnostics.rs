@@ -1256,7 +1256,7 @@ let map = HashMap::new();
 ```
 
 Please verify you didn't misspell the type/module's name or that you didn't
-forgot to import it:
+forget to import it:
 
 
 ```
@@ -1581,7 +1581,7 @@ mod SomeModule {
                                             // `SomeModule` module.
 }
 
-println!("const value: {}", SomeModule::PRIVATE); // error: constant `CONSTANT`
+println!("const value: {}", SomeModule::PRIVATE); // error: constant `PRIVATE`
                                                   //        is private
 ```
 

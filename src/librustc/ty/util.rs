@@ -18,7 +18,7 @@ use ich::NodeIdHashingMode;
 use traits::{self, ObligationCause};
 use ty::{self, Ty, TyCtxt, GenericParamDefKind, TypeFoldable};
 use ty::subst::{Substs, UnpackedKind};
-use ty::maps::TyCtxtAt;
+use ty::query::TyCtxtAt;
 use ty::TypeVariants::*;
 use ty::layout::{Integer, IntegerExt};
 use util::common::ErrorReported;
@@ -415,7 +415,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             return None;
         };
 
-        ty::maps::queries::coherent_trait::ensure(self, drop_trait);
+        ty::query::queries::coherent_trait::ensure(self, drop_trait);
 
         let mut dtor_did = None;
         let ty = self.type_of(adt_did);
@@ -518,8 +518,29 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         result
     }
 
+    /// True if `def_id` refers to a closure (e.g., `|x| x * 2`). Note
+    /// that closures have a def-id, but the closure *expression* also
+    /// has a `HirId` that is located within the context where the
+    /// closure appears (and, sadly, a corresponding `NodeId`, since
+    /// those are not yet phased out). The parent of the closure's
+    /// def-id will also be the context where it appears.
     pub fn is_closure(self, def_id: DefId) -> bool {
         self.def_key(def_id).disambiguated_data.data == DefPathData::ClosureExpr
+    }
+
+    /// True if `def_id` refers to a trait (e.g., `trait Foo { ... }`).
+    pub fn is_trait(self, def_id: DefId) -> bool {
+        if let DefPathData::Trait(_) = self.def_key(def_id).disambiguated_data.data {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True if this def-id refers to the implicit constructor for
+    /// a tuple struct like `struct Foo(u32)`.
+    pub fn is_struct_constructor(self, def_id: DefId) -> bool {
+        self.def_key(def_id).disambiguated_data.data == DefPathData::StructCtor
     }
 
     /// Given the `DefId` of a fn or closure, returns the `DefId` of
@@ -555,7 +576,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                           -> Option<ty::Binder<Ty<'tcx>>>
     {
         let closure_ty = self.mk_closure(closure_def_id, closure_substs);
-        let env_region = ty::ReLateBound(ty::DebruijnIndex::INNERMOST, ty::BrEnv);
+        let env_region = ty::ReLateBound(ty::INNERMOST, ty::BrEnv);
         let closure_kind_ty = closure_substs.closure_kind_ty(closure_def_id, self);
         let closure_kind = closure_kind_ty.to_opt_closure_kind()?;
         let env_ty = match closure_kind {
@@ -883,7 +904,7 @@ fn needs_drop_raw<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let (param_env, ty) = query.into_parts();
 
     let needs_drop = |ty: Ty<'tcx>| -> bool {
-        match tcx.try_get_query::<ty::queries::needs_drop_raw>(DUMMY_SP, param_env.and(ty)) {
+        match tcx.try_needs_drop_raw(DUMMY_SP, param_env.and(ty)) {
             Ok(v) => v,
             Err(mut bug) => {
                 // Cycles should be reported as an error by `check_representable`.
@@ -1014,8 +1035,8 @@ impl<'tcx> ExplicitSelf<'tcx> {
     }
 }
 
-pub fn provide(providers: &mut ty::maps::Providers) {
-    *providers = ty::maps::Providers {
+pub fn provide(providers: &mut ty::query::Providers) {
+    *providers = ty::query::Providers {
         is_copy_raw,
         is_sized_raw,
         is_freeze_raw,

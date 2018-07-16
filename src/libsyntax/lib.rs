@@ -14,18 +14,21 @@
 //!
 //! This API is completely unstable and subject to change.
 
+#![deny(bare_trait_objects)]
+
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/",
        test(attr(deny(warnings))))]
 
-#![feature(unicode_internals)]
+#![feature(const_atomic_usize_new)]
+#![feature(crate_visibility_modifier)]
+#![feature(macro_at_most_once_rep)]
+#![feature(rustc_attrs)]
 #![feature(rustc_diagnostic_macros)]
 #![feature(slice_sort_by_cached_key)]
-#![feature(const_atomic_usize_new)]
-#![feature(rustc_attrs)]
 #![feature(str_escape)]
-#![feature(crate_visibility_modifier)]
+#![feature(unicode_internals)]
 
 #![recursion_limit="256"]
 

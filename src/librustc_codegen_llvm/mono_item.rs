@@ -25,16 +25,14 @@ use monomorphize::Instance;
 use type_of::LayoutLlvmExt;
 use rustc::hir;
 use rustc::hir::def::Def;
-use rustc::hir::def_id::DefId;
+use rustc::hir::def_id::{DefId, LOCAL_CRATE};
 use rustc::mir::mono::{Linkage, Visibility};
 use rustc::ty::TypeFoldable;
 use rustc::ty::layout::LayoutOf;
-use syntax::attr;
 use std::fmt;
 
 pub use rustc::mir::mono::MonoItem;
 
-pub use rustc_mir::monomorphize::item::*;
 pub use rustc_mir::monomorphize::item::MonoItemExt as BaseMonoItemExt;
 
 pub trait MonoItemExt<'a, 'tcx>: fmt::Debug + BaseMonoItemExt<'a, 'tcx> {
@@ -68,6 +66,9 @@ pub trait MonoItemExt<'a, 'tcx>: fmt::Debug + BaseMonoItemExt<'a, 'tcx> {
                     span_bug!(item.span, "Mismatch between hir::Item type and MonoItem type")
                 }
             }
+            MonoItem::CustomSection(def_id) => {
+                base::define_custom_section(cx, def_id);
+            }
             MonoItem::Fn(instance) => {
                 base::codegen_instance(&cx, instance);
             }
@@ -99,6 +100,7 @@ pub trait MonoItemExt<'a, 'tcx>: fmt::Debug + BaseMonoItemExt<'a, 'tcx> {
             MonoItem::Fn(instance) => {
                 predefine_fn(cx, instance, linkage, visibility, &symbol_name);
             }
+            MonoItem::CustomSection(..) => {}
             MonoItem::GlobalAsm(..) => {}
         }
 
@@ -117,6 +119,9 @@ pub trait MonoItemExt<'a, 'tcx>: fmt::Debug + BaseMonoItemExt<'a, 'tcx> {
             }
             MonoItem::Static(id) => {
                 format!("Static({:?})", id)
+            }
+            MonoItem::CustomSection(id) => {
+                format!("CustomSection({:?})", id)
             }
             MonoItem::GlobalAsm(id) => {
                 format!("GlobalAsm({:?})", id)
@@ -173,7 +178,7 @@ fn predefine_fn<'a, 'tcx>(cx: &CodegenCx<'a, 'tcx>,
     // visibility as we're going to link this object all over the place but
     // don't want the symbols to get exported.
     if linkage != Linkage::Internal && linkage != Linkage::Private &&
-       attr::contains_name(cx.tcx.hir.krate_attrs(), "compiler_builtins") {
+       cx.tcx.is_compiler_builtins(LOCAL_CRATE) {
         unsafe {
             llvm::LLVMRustSetVisibility(lldecl, llvm::Visibility::Hidden);
         }

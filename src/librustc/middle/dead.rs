@@ -96,7 +96,11 @@ impl<'a, 'tcx> MarkSymbolVisitor<'a, 'tcx> {
     }
 
     fn lookup_and_handle_method(&mut self, id: hir::HirId) {
-        self.check_def_id(self.tables.type_dependent_defs()[id].def_id());
+        if let Some(def) = self.tables.type_dependent_defs().get(id) {
+            self.check_def_id(def.def_id());
+        } else {
+            bug!("no type-dependent def for method");
+        }
     }
 
     fn handle_field_access(&mut self, lhs: &hir::Expr, node_id: ast::NodeId) {
@@ -157,7 +161,7 @@ impl<'a, 'tcx> MarkSymbolVisitor<'a, 'tcx> {
                         intravisit::walk_item(self, &item);
                     }
                     hir::ItemEnum(..) => {
-                        self.inherited_pub_visibility = item.vis == hir::Public;
+                        self.inherited_pub_visibility = item.vis.node.is_pub();
                         intravisit::walk_item(self, &item);
                     }
                     hir::ItemFn(..)
@@ -212,7 +216,7 @@ impl<'a, 'tcx> Visitor<'tcx> for MarkSymbolVisitor<'a, 'tcx> {
         let has_repr_c = self.repr_has_repr_c;
         let inherited_pub_visibility = self.inherited_pub_visibility;
         let live_fields = def.fields().iter().filter(|f| {
-            has_repr_c || inherited_pub_visibility || f.vis == hir::Public
+            has_repr_c || inherited_pub_visibility || f.vis.node.is_pub()
         });
         self.live_symbols.extend(live_fields.map(|f| f.id));
 
@@ -284,7 +288,17 @@ impl<'a, 'tcx> Visitor<'tcx> for MarkSymbolVisitor<'a, 'tcx> {
 fn has_allow_dead_code_or_lang_attr(tcx: TyCtxt,
                                     id: ast::NodeId,
                                     attrs: &[ast::Attribute]) -> bool {
-    if attr::contains_name(attrs, "lang") || attr::contains_name(attrs, "panic_implementation") {
+    if attr::contains_name(attrs, "lang") {
+        return true;
+    }
+
+    // (To be) stable attribute for #[lang = "panic_impl"]
+    if attr::contains_name(attrs, "panic_implementation") {
+        return true;
+    }
+
+    // (To be) stable attribute for #[lang = "oom"]
+    if attr::contains_name(attrs, "alloc_error_handler") {
         return true;
     }
 
@@ -455,13 +469,9 @@ impl<'a, 'tcx> DeadVisitor<'a, 'tcx> {
 
     fn should_warn_about_field(&mut self, field: &hir::StructField) -> bool {
         let field_type = self.tcx.type_of(self.tcx.hir.local_def_id(field.id));
-        let is_marker_field = match field_type.ty_to_def_id() {
-            Some(def_id) => self.tcx.lang_items().items().iter().any(|item| *item == Some(def_id)),
-            _ => false
-        };
         !field.is_positional()
             && !self.symbol_is_live(field.id, None)
-            && !is_marker_field
+            && !field_type.is_phantom_data()
             && !has_allow_dead_code_or_lang_attr(self.tcx, field.id, &field.attrs)
     }
 
@@ -599,7 +609,7 @@ impl<'a, 'tcx> Visitor<'tcx> for DeadVisitor<'a, 'tcx> {
                 if !self.symbol_is_live(impl_item.id, None) {
                     self.warn_dead_code(impl_item.id,
                                         impl_item.span,
-                                        impl_item.name,
+                                        impl_item.ident.name,
                                         "associated const",
                                         "used");
                 }
@@ -608,7 +618,7 @@ impl<'a, 'tcx> Visitor<'tcx> for DeadVisitor<'a, 'tcx> {
             hir::ImplItemKind::Method(_, body_id) => {
                 if !self.symbol_is_live(impl_item.id, None) {
                     let span = self.tcx.sess.codemap().def_span(impl_item.span);
-                    self.warn_dead_code(impl_item.id, span, impl_item.name, "method", "used");
+                    self.warn_dead_code(impl_item.id, span, impl_item.ident.name, "method", "used");
                 }
                 self.visit_nested_body(body_id)
             }

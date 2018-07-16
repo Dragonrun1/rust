@@ -43,7 +43,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         wbcx.visit_closures();
         wbcx.visit_liberated_fn_sigs();
         wbcx.visit_fru_field_types();
-        wbcx.visit_anon_types();
+        wbcx.visit_anon_types(body.value.span);
         wbcx.visit_cast_types();
         wbcx.visit_free_region_map();
         wbcx.visit_user_provided_tys();
@@ -257,13 +257,11 @@ impl<'cx, 'gcx, 'tcx> Visitor<'gcx> for WritebackCx<'cx, 'gcx, 'tcx> {
     fn visit_pat(&mut self, p: &'gcx hir::Pat) {
         match p.node {
             hir::PatKind::Binding(..) => {
-                let bm = *self.fcx
-                    .tables
-                    .borrow()
-                    .pat_binding_modes()
-                    .get(p.hir_id)
-                    .expect("missing binding mode");
-                self.tables.pat_binding_modes_mut().insert(p.hir_id, bm);
+                if let Some(&bm) = self.fcx.tables.borrow().pat_binding_modes().get(p.hir_id) {
+                    self.tables.pat_binding_modes_mut().insert(p.hir_id, bm);
+                } else {
+                    self.tcx().sess.delay_span_bug(p.span, "missing binding mode");
+                }
             }
             hir::PatKind::Struct(_, ref fields, _) => {
                 for field in fields {
@@ -385,18 +383,28 @@ impl<'cx, 'gcx, 'tcx> WritebackCx<'cx, 'gcx, 'tcx> {
         }
     }
 
-    fn visit_anon_types(&mut self) {
-        let gcx = self.tcx().global_tcx();
+    fn visit_anon_types(&mut self, span: Span) {
         for (&def_id, anon_defn) in self.fcx.anon_types.borrow().iter() {
-            let node_id = gcx.hir.as_local_node_id(def_id).unwrap();
+            let node_id = self.tcx().hir.as_local_node_id(def_id).unwrap();
             let instantiated_ty = self.resolve(&anon_defn.concrete_ty, &node_id);
             let definition_ty = self.fcx.infer_anon_definition_from_instantiation(
                 def_id,
                 anon_defn,
                 instantiated_ty,
             );
-            let hir_id = self.tcx().hir.node_to_hir_id(node_id);
-            self.tables.node_types_mut().insert(hir_id, definition_ty);
+            let old = self.tables.concrete_existential_types.insert(def_id, definition_ty);
+            if let Some(old) = old {
+                if old != definition_ty {
+                    span_bug!(
+                        span,
+                        "visit_anon_types tried to write \
+                        different types for the same existential type: {:?}, {:?}, {:?}",
+                        def_id,
+                        definition_ty,
+                        old,
+                    );
+                }
+            }
         }
     }
 
@@ -518,7 +526,7 @@ impl<'cx, 'gcx, 'tcx> WritebackCx<'cx, 'gcx, 'tcx> {
         }
     }
 
-    fn resolve<T>(&self, x: &T, span: &Locatable) -> T::Lifted
+    fn resolve<T>(&self, x: &T, span: &dyn Locatable) -> T::Lifted
     where
         T: TypeFoldable<'tcx> + ty::Lift<'gcx>,
     {
@@ -572,14 +580,14 @@ impl Locatable for hir::HirId {
 struct Resolver<'cx, 'gcx: 'cx + 'tcx, 'tcx: 'cx> {
     tcx: TyCtxt<'cx, 'gcx, 'tcx>,
     infcx: &'cx InferCtxt<'cx, 'gcx, 'tcx>,
-    span: &'cx Locatable,
+    span: &'cx dyn Locatable,
     body: &'gcx hir::Body,
 }
 
 impl<'cx, 'gcx, 'tcx> Resolver<'cx, 'gcx, 'tcx> {
     fn new(
         fcx: &'cx FnCtxt<'cx, 'gcx, 'tcx>,
-        span: &'cx Locatable,
+        span: &'cx dyn Locatable,
         body: &'gcx hir::Body,
     ) -> Resolver<'cx, 'gcx, 'tcx> {
         Resolver {

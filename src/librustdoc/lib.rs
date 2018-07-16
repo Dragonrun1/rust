@@ -18,6 +18,7 @@
 #![feature(box_patterns)]
 #![feature(box_syntax)]
 #![feature(fs_read_write)]
+#![feature(iterator_find_map)]
 #![feature(set_stdio)]
 #![feature(slice_sort_by_cached_key)]
 #![feature(test)]
@@ -46,7 +47,7 @@ extern crate test as testing;
 #[macro_use] extern crate log;
 extern crate rustc_errors as errors;
 extern crate pulldown_cmark;
-extern crate tempdir;
+extern crate tempfile;
 extern crate minifier;
 
 extern crate serialize as rustc_serialize; // used by deriving
@@ -67,6 +68,7 @@ use rustc::session::search_paths::SearchPaths;
 use rustc::session::config::{ErrorOutputType, RustcOptGroup, Externs, CodegenOptions};
 use rustc::session::config::{nightly_options, build_codegen_options};
 use rustc_target::spec::TargetTriple;
+use rustc::session::config::get_cmd_lint_options;
 
 #[macro_use]
 pub mod externalfiles;
@@ -102,10 +104,14 @@ struct Output {
 }
 
 pub fn main() {
-    const STACK_SIZE: usize = 32_000_000; // 32MB
+    let thread_stack_size: usize = if cfg!(target_os = "haiku") {
+        16_000_000 // 16MB on Haiku
+    } else {
+        32_000_000 // 32MB on other platforms
+    };
     rustc_driver::set_sigpipe_handler();
     env_logger::init();
-    let res = std::thread::Builder::new().stack_size(STACK_SIZE).spawn(move || {
+    let res = std::thread::Builder::new().stack_size(thread_stack_size).spawn(move || {
         syntax::with_globals(move || {
             get_args().map(|args| main_args(&args)).unwrap_or(1)
         })
@@ -159,7 +165,7 @@ pub fn opts() -> Vec<RustcOptGroup> {
             o.optmulti("", "extern", "pass an --extern to rustc", "NAME=PATH")
         }),
         stable("plugin-path", |o| {
-            o.optmulti("", "plugin-path", "directory to load plugins from", "DIR")
+            o.optmulti("", "plugin-path", "removed", "DIR")
         }),
         stable("C", |o| {
             o.optmulti("C", "codegen", "pass a codegen option to rustc", "OPT[=VALUE]")
@@ -172,7 +178,7 @@ pub fn opts() -> Vec<RustcOptGroup> {
                        "PASSES")
         }),
         stable("plugins", |o| {
-            o.optmulti("", "plugins", "space separated list of plugins to also load",
+            o.optmulti("", "plugins", "removed",
                        "PLUGINS")
         }),
         stable("no-default", |o| {
@@ -302,6 +308,28 @@ pub fn opts() -> Vec<RustcOptGroup> {
              o.optflag("",
                        "disable-minification",
                        "Disable minification applied on JS files")
+        }),
+        unstable("warn", |o| {
+            o.optmulti("W", "warn", "Set lint warnings", "OPT")
+        }),
+        unstable("allow", |o| {
+            o.optmulti("A", "allow", "Set lint allowed", "OPT")
+        }),
+        unstable("deny", |o| {
+            o.optmulti("D", "deny", "Set lint denied", "OPT")
+        }),
+        unstable("forbid", |o| {
+            o.optmulti("F", "forbid", "Set lint forbidden", "OPT")
+        }),
+        unstable("cap-lints", |o| {
+            o.optmulti(
+                "",
+                "cap-lints",
+                "Set the most restrictive lint level. \
+                 More restrictive lints are capped at this \
+                 level. By default, it is at `forbid` level.",
+                "LEVEL",
+            )
         }),
     ]
 }
@@ -635,6 +663,8 @@ where R: 'static + Send,
         *x == "force-unstable-if-unmarked"
     });
 
+    let (lint_opts, describe_lints, lint_cap) = get_cmd_lint_options(matches, error_format);
+
     let (tx, rx) = channel();
 
     rustc_driver::monitor(move || syntax::with_globals(move || {
@@ -643,7 +673,8 @@ where R: 'static + Send,
         let (mut krate, renderinfo) =
             core::run_core(paths, cfgs, externs, Input::File(cratefile), triple, maybe_sysroot,
                            display_warnings, crate_name.clone(),
-                           force_unstable_if_unmarked, edition, cg, error_format);
+                           force_unstable_if_unmarked, edition, cg, error_format,
+                           lint_opts, lint_cap, describe_lints);
 
         info!("finished with rustc");
 
@@ -710,9 +741,16 @@ where R: 'static + Send,
             }
         }
 
+        if !plugins.is_empty() {
+            eprintln!("WARNING: --plugins no longer functions; see CVE-2018-1000622");
+        }
+
+        if !plugin_path.is_none() {
+            eprintln!("WARNING: --plugin-path no longer functions; see CVE-2018-1000622");
+        }
+
         // Load all plugins/passes into a PluginManager
-        let path = plugin_path.unwrap_or("/tmp/rustdoc/plugins".to_string());
-        let mut pm = plugins::PluginManager::new(PathBuf::from(path));
+        let mut pm = plugins::PluginManager::new();
         for pass in &passes {
             let plugin = match passes::PASSES.iter()
                                              .position(|&(p, ..)| {
@@ -725,10 +763,6 @@ where R: 'static + Send,
                 },
             };
             pm.add_plugin(plugin);
-        }
-        info!("loading plugins...");
-        for pname in plugins {
-            pm.load_plugin(pname);
         }
 
         // Run everything!
@@ -745,8 +779,6 @@ fn check_deprecated_options(matches: &getopts::Matches, diag: &errors::Handler) 
     let deprecated_flags = [
        "input-format",
        "output-format",
-       "plugin-path",
-       "plugins",
        "no-defaults",
        "passes",
     ];

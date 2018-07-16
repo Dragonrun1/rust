@@ -8,6 +8,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+#![deny(bare_trait_objects)]
+
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
@@ -27,7 +29,8 @@ extern crate arena;
 extern crate rustc;
 extern crate rustc_data_structures;
 
-use self::Namespace::*;
+pub use rustc::hir::def::{Namespace, PerNS};
+
 use self::TypeParameters::*;
 use self::RibKind::*;
 
@@ -37,13 +40,14 @@ use rustc::middle::cstore::{CrateStore, CrateLoader};
 use rustc::session::Session;
 use rustc::lint;
 use rustc::hir::def::*;
+use rustc::hir::def::Namespace::*;
 use rustc::hir::def_id::{CRATE_DEF_INDEX, LOCAL_CRATE, DefId};
 use rustc::ty;
 use rustc::hir::{Freevar, FreevarMap, TraitCandidate, TraitMap, GlobMap};
 use rustc::util::nodemap::{NodeMap, NodeSet, FxHashMap, FxHashSet, DefIdMap};
 
 use syntax::codemap::CodeMap;
-use syntax::ext::hygiene::{Mark, MarkKind, SyntaxContext};
+use syntax::ext::hygiene::{Mark, Transparency, SyntaxContext};
 use syntax::ast::{self, Name, NodeId, Ident, FloatTy, IntTy, UintTy};
 use syntax::ext::base::SyntaxExtension;
 use syntax::ext::base::Determinacy::{self, Determined, Undetermined};
@@ -53,8 +57,8 @@ use syntax::util::lev_distance::find_best_match_for_name;
 
 use syntax::visit::{self, FnKind, Visitor};
 use syntax::attr;
-use syntax::ast::{Arm, BindingMode, Block, Crate, Expr, ExprKind};
-use syntax::ast::{FnDecl, ForeignItem, ForeignItemKind, GenericParam, Generics};
+use syntax::ast::{CRATE_NODE_ID, Arm, IsAsync, BindingMode, Block, Crate, Expr, ExprKind};
+use syntax::ast::{FnDecl, ForeignItem, ForeignItemKind, GenericParamKind, Generics};
 use syntax::ast::{Item, ItemKind, ImplItem, ImplItemKind};
 use syntax::ast::{Label, Local, Mutability, Pat, PatKind, Path};
 use syntax::ast::{QSelf, TraitItemKind, TraitRef, Ty, TyKind};
@@ -203,6 +207,7 @@ fn resolve_struct_error<'sess, 'a>(resolver: &'sess Resolver,
                 Def::AssociatedTy(..) | Def::PrimTy(..) | Def::Fn(..) | Def::Const(..) |
                 Def::Static(..) | Def::StructCtor(..) | Def::VariantCtor(..) | Def::Method(..) |
                 Def::AssociatedConst(..) | Def::Local(..) | Def::Upvar(..) | Def::Label(..) |
+                Def::Existential(..) |
                 Def::Macro(..) | Def::GlobalAsm(..) | Def::Err =>
                     bug!("TypeParametersFromOuterFunction should only be used with Def::SelfTy or \
                          Def::TyParam")
@@ -451,7 +456,7 @@ enum AliasPossibility {
     Maybe,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, Debug)]
 enum PathSource<'a> {
     // Type paths `Path`.
     Type,
@@ -614,45 +619,6 @@ impl<'a> PathSource<'a> {
     }
 }
 
-/// Different kinds of symbols don't influence each other.
-///
-/// Therefore, they have a separate universe (namespace).
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Namespace {
-    TypeNS,
-    ValueNS,
-    MacroNS,
-}
-
-/// Just a helper ‒ separate structure for each namespace.
-#[derive(Clone, Default, Debug)]
-pub struct PerNS<T> {
-    value_ns: T,
-    type_ns: T,
-    macro_ns: T,
-}
-
-impl<T> ::std::ops::Index<Namespace> for PerNS<T> {
-    type Output = T;
-    fn index(&self, ns: Namespace) -> &T {
-        match ns {
-            ValueNS => &self.value_ns,
-            TypeNS => &self.type_ns,
-            MacroNS => &self.macro_ns,
-        }
-    }
-}
-
-impl<T> ::std::ops::IndexMut<Namespace> for PerNS<T> {
-    fn index_mut(&mut self, ns: Namespace) -> &mut T {
-        match ns {
-            ValueNS => &mut self.value_ns,
-            TypeNS => &mut self.type_ns,
-            MacroNS => &mut self.macro_ns,
-        }
-    }
-}
-
 struct UsePlacementFinder {
     target_module: NodeId,
     span: Option<Span>,
@@ -782,15 +748,17 @@ impl<'a, 'tcx> Visitor<'tcx> for Resolver<'a> {
                 function_kind: FnKind<'tcx>,
                 declaration: &'tcx FnDecl,
                 _: Span,
-                node_id: NodeId) {
-        let rib_kind = match function_kind {
-            FnKind::ItemFn(..) => {
-                ItemRibKind
-            }
-            FnKind::Method(_, _, _, _) => {
-                TraitOrImplItemRibKind
-            }
-            FnKind::Closure(_) => ClosureRibKind(node_id),
+                node_id: NodeId)
+    {
+        let (rib_kind, asyncness) = match function_kind {
+            FnKind::ItemFn(_, ref header, ..) =>
+                (ItemRibKind, header.asyncness),
+            FnKind::Method(_, ref sig, _, _) =>
+                (TraitOrImplItemRibKind, sig.header.asyncness),
+            FnKind::Closure(_) =>
+                // Async closures aren't resolved through `visit_fn`-- they're
+                // processed separately
+                (ClosureRibKind(node_id), IsAsync::NotAsync),
         };
 
         // Create a value rib for the function.
@@ -810,7 +778,13 @@ impl<'a, 'tcx> Visitor<'tcx> for Resolver<'a> {
         }
         visit::walk_fn_ret_ty(self, &declaration.output);
 
-        // Resolve the function body.
+        // Resolve the function body, potentially inside the body of an async closure
+        if let IsAsync::Async { closure_id, .. } = asyncness {
+            let rib_kind = ClosureRibKind(closure_id);
+            self.ribs[ValueNS].push(Rib::new(rib_kind));
+            self.label_ribs.push(Rib::new(rib_kind));
+        }
+
         match function_kind {
             FnKind::ItemFn(.., body) |
             FnKind::Method(.., body) => {
@@ -820,6 +794,12 @@ impl<'a, 'tcx> Visitor<'tcx> for Resolver<'a> {
                 self.visit_expr(body);
             }
         };
+
+        // Leave the body of the async closure
+        if asyncness.is_async() {
+            self.label_ribs.pop();
+            self.ribs[ValueNS].pop();
+        }
 
         debug!("(resolving function) leaving function");
 
@@ -833,31 +813,41 @@ impl<'a, 'tcx> Visitor<'tcx> for Resolver<'a> {
         // put all the parameters on the ban list and then remove
         // them one by one as they are processed and become available.
         let mut default_ban_rib = Rib::new(ForwardTyParamBanRibKind);
+        let mut found_default = false;
         default_ban_rib.bindings.extend(generics.params.iter()
-            .filter_map(|p| if let GenericParam::Type(ref tp) = *p { Some(tp) } else { None })
-            .skip_while(|p| p.default.is_none())
-            .map(|p| (Ident::with_empty_ctxt(p.ident.name), Def::Err)));
+            .filter_map(|param| match param.kind {
+                GenericParamKind::Lifetime { .. } => None,
+                GenericParamKind::Type { ref default, .. } => {
+                    if found_default || default.is_some() {
+                        found_default = true;
+                        return Some((Ident::with_empty_ctxt(param.ident.name), Def::Err));
+                    }
+                    None
+                }
+            }));
 
         for param in &generics.params {
-            match *param {
-                GenericParam::Lifetime(_) => self.visit_generic_param(param),
-                GenericParam::Type(ref ty_param) => {
-                    for bound in &ty_param.bounds {
-                        self.visit_ty_param_bound(bound);
+            match param.kind {
+                GenericParamKind::Lifetime { .. } => self.visit_generic_param(param),
+                GenericParamKind::Type { ref default, .. } => {
+                    for bound in &param.bounds {
+                        self.visit_param_bound(bound);
                     }
 
-                    if let Some(ref ty) = ty_param.default {
+                    if let Some(ref ty) = default {
                         self.ribs[TypeNS].push(default_ban_rib);
                         self.visit_ty(ty);
                         default_ban_rib = self.ribs[TypeNS].pop().unwrap();
                     }
 
                     // Allow all following defaults to refer to this type parameter.
-                    default_ban_rib.bindings.remove(&Ident::with_empty_ctxt(ty_param.ident.name));
+                    default_ban_rib.bindings.remove(&Ident::with_empty_ctxt(param.ident.name));
                 }
             }
         }
-        for p in &generics.where_clause.predicates { self.visit_where_predicate(p); }
+        for p in &generics.where_clause.predicates {
+            self.visit_where_predicate(p);
+        }
     }
 }
 
@@ -1304,7 +1294,7 @@ impl PrimitiveTypeTable {
 /// This is the visitor that walks the whole crate.
 pub struct Resolver<'a> {
     session: &'a Session,
-    cstore: &'a CrateStore,
+    cstore: &'a dyn CrateStore,
 
     pub definitions: Definitions,
 
@@ -1346,6 +1336,7 @@ pub struct Resolver<'a> {
     primitive_type_table: PrimitiveTypeTable,
 
     def_map: DefMap,
+    import_map: ImportMap,
     pub freevars: FreevarMap,
     freevars_seen: NodeMap<NodeMap<usize>>,
     pub export_map: ExportMap,
@@ -1399,7 +1390,7 @@ pub struct Resolver<'a> {
     /// true if `#![feature(use_extern_macros)]`
     use_extern_macros: bool,
 
-    crate_loader: &'a mut CrateLoader,
+    crate_loader: &'a mut dyn CrateLoader,
     macro_names: FxHashSet<Ident>,
     global_macros: FxHashMap<Name, &'a NameBinding<'a>>,
     pub all_macros: FxHashMap<Name, Def>,
@@ -1500,14 +1491,34 @@ impl<'a> hir::lowering::Resolver for Resolver<'a> {
                                  |resolver, span, error| resolve_error(resolver, span, error))
     }
 
-    fn resolve_str_path(&mut self, span: Span, crate_root: Option<&str>,
-                        components: &[&str], is_value: bool) -> hir::Path {
+    fn resolve_str_path(
+        &mut self,
+        span: Span,
+        crate_root: Option<&str>,
+        components: &[&str],
+        args: Option<P<hir::GenericArgs>>,
+        is_value: bool
+    ) -> hir::Path {
+        let mut segments = iter::once(keywords::CrateRoot.ident())
+            .chain(
+                crate_root.into_iter()
+                    .chain(components.iter().cloned())
+                    .map(Ident::from_str)
+            ).map(hir::PathSegment::from_ident).collect::<Vec<_>>();
+
+        if let Some(args) = args {
+            let ident = segments.last().unwrap().ident;
+            *segments.last_mut().unwrap() = hir::PathSegment {
+                ident,
+                args: Some(args),
+                infer_types: true,
+            };
+        }
+
         let mut path = hir::Path {
             span,
             def: Def::Err,
-            segments: iter::once(keywords::CrateRoot.name()).chain({
-                crate_root.into_iter().chain(components.iter().cloned()).map(Symbol::intern)
-            }).map(hir::PathSegment::from_name).collect(),
+            segments: segments.into(),
         };
 
         self.resolve_hir_path(&mut path, is_value);
@@ -1516,6 +1527,10 @@ impl<'a> hir::lowering::Resolver for Resolver<'a> {
 
     fn get_resolution(&mut self, id: NodeId) -> Option<PathResolution> {
         self.def_map.get(&id).cloned()
+    }
+
+    fn get_import(&mut self, id: NodeId) -> PerNS<Option<PathResolution>> {
+        self.import_map.get(&id).cloned().unwrap_or_default()
     }
 
     fn definitions(&mut self) -> &mut Definitions {
@@ -1537,16 +1552,16 @@ impl<'a> Resolver<'a> {
             hir::Path {
                 span,
                 def: Def::Err,
-                segments: iter::once(keywords::CrateRoot.name()).chain({
-                    path_str.split("::").skip(1).map(Symbol::intern)
-                }).map(hir::PathSegment::from_name).collect(),
+                segments: iter::once(keywords::CrateRoot.ident()).chain({
+                    path_str.split("::").skip(1).map(Ident::from_str)
+                }).map(hir::PathSegment::from_ident).collect(),
             }
         } else {
             hir::Path {
                 span,
                 def: Def::Err,
-                segments: path_str.split("::").map(Symbol::intern)
-                                  .map(hir::PathSegment::from_name).collect(),
+                segments: path_str.split("::").map(Ident::from_str)
+                                  .map(hir::PathSegment::from_ident).collect(),
             }
         };
         self.resolve_hir_path_cb(&mut path, is_value, |_, _, _| errored = true);
@@ -1559,13 +1574,11 @@ impl<'a> Resolver<'a> {
 
     /// resolve_hir_path, but takes a callback in case there was an error
     fn resolve_hir_path_cb<F>(&mut self, path: &mut hir::Path, is_value: bool, error_callback: F)
-            where F: for<'c, 'b> FnOnce(&'c mut Resolver, Span, ResolutionError<'b>)
-        {
+        where F: for<'c, 'b> FnOnce(&'c mut Resolver, Span, ResolutionError<'b>)
+    {
         let namespace = if is_value { ValueNS } else { TypeNS };
         let hir::Path { ref segments, span, ref mut def } = *path;
-        let path: Vec<Ident> = segments.iter()
-            .map(|seg| Ident::new(seg.name, span))
-            .collect();
+        let path: Vec<_> = segments.iter().map(|seg| seg.ident).collect();
         // FIXME (Manishearth): Intra doc links won't get warned of epoch changes
         match self.resolve_path(&path, Some(namespace), true, span, CrateLint::No) {
             PathResult::Module(module) => *def = module.def().unwrap(),
@@ -1593,11 +1606,11 @@ impl<'a> Resolver<'a> {
 
 impl<'a> Resolver<'a> {
     pub fn new(session: &'a Session,
-               cstore: &'a CrateStore,
+               cstore: &'a dyn CrateStore,
                krate: &Crate,
                crate_name: &str,
                make_glob_map: MakeGlobMap,
-               crate_loader: &'a mut CrateLoader,
+               crate_loader: &'a mut dyn CrateLoader,
                arenas: &'a ResolverArenas<'a>)
                -> Resolver<'a> {
         let root_def_id = DefId::local(CRATE_DEF_INDEX);
@@ -1665,6 +1678,7 @@ impl<'a> Resolver<'a> {
             primitive_type_table: PrimitiveTypeTable::new(),
 
             def_map: NodeMap(),
+            import_map: NodeMap(),
             freevars: NodeMap(),
             freevars_seen: NodeMap(),
             export_map: FxHashMap(),
@@ -1838,6 +1852,8 @@ impl<'a> Resolver<'a> {
             } else {
                 ident.span.modern()
             }
+        } else {
+            ident = ident.modern_and_legacy();
         }
 
         // Walk backwards up the ribs in scope.
@@ -1877,7 +1893,12 @@ impl<'a> Resolver<'a> {
 
         ident.span = ident.span.modern();
         loop {
-            module = unwrap_or!(self.hygienic_lexical_parent(module, &mut ident.span), break);
+            let (opt_module, poisoned) = if record_used {
+                self.hygienic_lexical_parent_with_compatibility_fallback(module, &mut ident.span)
+            } else {
+                (self.hygienic_lexical_parent(module, &mut ident.span), false)
+            };
+            module = unwrap_or!(opt_module, break);
             let orig_current_module = self.current_module;
             self.current_module = module; // Lexical resolutions can never be a privacy error.
             let result = self.resolve_ident_in_module_unadjusted(
@@ -1886,7 +1907,19 @@ impl<'a> Resolver<'a> {
             self.current_module = orig_current_module;
 
             match result {
-                Ok(binding) => return Some(LexicalScopeBinding::Item(binding)),
+                Ok(binding) => {
+                    if poisoned {
+                        self.session.buffer_lint_with_diagnostic(
+                            lint::builtin::PROC_MACRO_DERIVE_RESOLUTION_FALLBACK,
+                            CRATE_NODE_ID, ident.span,
+                            &format!("cannot find {} `{}` in this scope", ns.descr(), ident),
+                            lint::builtin::BuiltinLintDiagnostics::
+                                ProcMacroDeriveResolutionFallback(ident.span),
+                        );
+                    }
+                    return Some(LexicalScopeBinding::Item(binding))
+                }
+                _ if poisoned => break,
                 Err(Undetermined) => return None,
                 Err(Determined) => {}
             }
@@ -1921,7 +1954,7 @@ impl<'a> Resolver<'a> {
         None
     }
 
-    fn hygienic_lexical_parent(&mut self, mut module: Module<'a>, span: &mut Span)
+    fn hygienic_lexical_parent(&mut self, module: Module<'a>, span: &mut Span)
                                -> Option<Module<'a>> {
         if !module.expansion.is_descendant_of(span.ctxt().outer()) {
             return Some(self.macro_def_scope(span.remove_mark()));
@@ -1931,22 +1964,41 @@ impl<'a> Resolver<'a> {
             return Some(module.parent.unwrap());
         }
 
-        let mut module_expansion = module.expansion.modern(); // for backward compatibility
-        while let Some(parent) = module.parent {
-            let parent_expansion = parent.expansion.modern();
-            if module_expansion.is_descendant_of(parent_expansion) &&
-               parent_expansion != module_expansion {
-                return if parent_expansion.is_descendant_of(span.ctxt().outer()) {
-                    Some(parent)
-                } else {
-                    None
-                };
-            }
-            module = parent;
-            module_expansion = parent_expansion;
+        None
+    }
+
+    fn hygienic_lexical_parent_with_compatibility_fallback(
+        &mut self, module: Module<'a>, span: &mut Span) -> (Option<Module<'a>>, /* poisoned */ bool
+    ) {
+        if let module @ Some(..) = self.hygienic_lexical_parent(module, span) {
+            return (module, false);
         }
 
-        None
+        // We need to support the next case under a deprecation warning
+        // ```
+        // struct MyStruct;
+        // ---- begin: this comes from a proc macro derive
+        // mod implementation_details {
+        //     // Note that `MyStruct` is not in scope here.
+        //     impl SomeTrait for MyStruct { ... }
+        // }
+        // ---- end
+        // ```
+        // So we have to fall back to the module's parent during lexical resolution in this case.
+        if let Some(parent) = module.parent {
+            // Inner module is inside the macro, parent module is outside of the macro.
+            if module.expansion != parent.expansion &&
+            module.expansion.is_descendant_of(parent.expansion) {
+                // The macro is a proc macro derive
+                if module.expansion.looks_like_proc_macro_derive() {
+                    if parent.expansion.is_descendant_of(span.ctxt().outer()) {
+                        return (module.parent, true);
+                    }
+                }
+            }
+        }
+
+        (None, false)
     }
 
     fn resolve_ident_in_module(&mut self,
@@ -1969,12 +2021,36 @@ impl<'a> Resolver<'a> {
         result
     }
 
-    fn resolve_crate_root(&mut self, mut ctxt: SyntaxContext, legacy: bool) -> Module<'a> {
-        let mark = if legacy {
+    fn resolve_crate_root(&mut self, ident: Ident) -> Module<'a> {
+        let mut ctxt = ident.span.ctxt();
+        let mark = if ident.name == keywords::DollarCrate.name() {
             // When resolving `$crate` from a `macro_rules!` invoked in a `macro`,
             // we don't want to pretend that the `macro_rules!` definition is in the `macro`
             // as described in `SyntaxContext::apply_mark`, so we ignore prepended modern marks.
-            ctxt.marks().into_iter().find(|&mark| mark.kind() != MarkKind::Modern)
+            // FIXME: This is only a guess and it doesn't work correctly for `macro_rules!`
+            // definitions actually produced by `macro` and `macro` definitions produced by
+            // `macro_rules!`, but at least such configurations are not stable yet.
+            ctxt = ctxt.modern_and_legacy();
+            let mut iter = ctxt.marks().into_iter().rev().peekable();
+            let mut result = None;
+            // Find the last modern mark from the end if it exists.
+            while let Some(&(mark, transparency)) = iter.peek() {
+                if transparency == Transparency::Opaque {
+                    result = Some(mark);
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+            // Then find the last legacy mark from the end if it exists.
+            for (mark, transparency) in iter {
+                if transparency == Transparency::SemiTransparent {
+                    result = Some(mark);
+                } else {
+                    break;
+                }
+            }
+            result
         } else {
             ctxt = ctxt.modern();
             ctxt.adjust(Mark::root())
@@ -2078,9 +2154,9 @@ impl<'a> Resolver<'a> {
             ItemKind::Ty(_, ref generics) |
             ItemKind::Struct(_, ref generics) |
             ItemKind::Union(_, ref generics) |
-            ItemKind::Fn(.., ref generics, _) => {
+            ItemKind::Fn(_, _, ref generics, _) => {
                 self.with_type_parameter_rib(HasTypeParameters(generics, ItemRibKind),
-                                             |this| visit::walk_item(this, item));
+                                         |this| visit::walk_item(this, item));
             }
 
             ItemKind::Impl(.., ref generics, ref opt_trait_ref, ref self_type, ref impl_items) =>
@@ -2096,7 +2172,7 @@ impl<'a> Resolver<'a> {
                     let local_def_id = this.definitions.local_def_id(item.id);
                     this.with_self_rib(Def::SelfTy(Some(local_def_id), None), |this| {
                         this.visit_generics(generics);
-                        walk_list!(this, visit_ty_param_bound, bounds);
+                        walk_list!(this, visit_param_bound, bounds);
 
                         for trait_item in trait_items {
                             this.check_proc_macro_attrs(&trait_item.attrs);
@@ -2139,7 +2215,7 @@ impl<'a> Resolver<'a> {
                     let local_def_id = this.definitions.local_def_id(item.id);
                     this.with_self_rib(Def::SelfTy(Some(local_def_id), None), |this| {
                         this.visit_generics(generics);
-                        walk_list!(this, visit_ty_param_bound, bounds);
+                        walk_list!(this, visit_param_bound, bounds);
                     });
                 });
             }
@@ -2215,7 +2291,7 @@ impl<'a> Resolver<'a> {
                     }
                 }
             }
-            ast::UseTreeKind::Simple(_) => {},
+            ast::UseTreeKind::Simple(..) => {},
             ast::UseTreeKind::Glob => {},
         }
     }
@@ -2227,10 +2303,11 @@ impl<'a> Resolver<'a> {
             HasTypeParameters(generics, rib_kind) => {
                 let mut function_type_rib = Rib::new(rib_kind);
                 let mut seen_bindings = FxHashMap();
-                for param in &generics.params {
-                    if let GenericParam::Type(ref type_parameter) = *param {
-                        let ident = type_parameter.ident.modern();
-                        debug!("with_type_parameter_rib: {}", type_parameter.id);
+                generics.params.iter().for_each(|param| match param.kind {
+                    GenericParamKind::Lifetime { .. } => {}
+                    GenericParamKind::Type { .. } => {
+                        let ident = param.ident.modern();
+                        debug!("with_type_parameter_rib: {}", param.id);
 
                         if seen_bindings.contains_key(&ident) {
                             let span = seen_bindings.get(&ident).unwrap();
@@ -2238,17 +2315,16 @@ impl<'a> Resolver<'a> {
                                 ident.name,
                                 span,
                             );
-                            resolve_error(self, type_parameter.ident.span, err);
+                            resolve_error(self, param.ident.span, err);
                         }
-                        seen_bindings.entry(ident).or_insert(type_parameter.ident.span);
+                        seen_bindings.entry(ident).or_insert(param.ident.span);
 
-                        // plain insert (no renaming)
-                        let def_id = self.definitions.local_def_id(type_parameter.id);
-                        let def = Def::TyParam(def_id);
+                    // Plain insert (no renaming).
+                    let def = Def::TyParam(self.definitions.local_def_id(param.id));
                         function_type_rib.bindings.insert(ident, def);
-                        self.record_def(type_parameter.id, PathResolution::new(def));
+                        self.record_def(param.id, PathResolution::new(def));
                     }
-                }
+                });
                 self.ribs[TypeNS].push(function_type_rib);
             }
 
@@ -2394,7 +2470,7 @@ impl<'a> Resolver<'a> {
                                                 visit::walk_impl_item(this, impl_item)
                                             );
                                         }
-                                        ImplItemKind::Method(_, _) => {
+                                        ImplItemKind::Method(..) => {
                                             // If this is a trait impl, ensure the method
                                             // exists in trait
                                             this.check_trait_item(impl_item.ident,
@@ -2615,6 +2691,7 @@ impl<'a> Resolver<'a> {
         // must not add it if it's in the bindings map
         // because that breaks the assumptions later
         // passes make about or-patterns.)
+        let ident = ident.modern_and_legacy();
         let mut def = Def::Local(pat_id);
         match bindings.get(&ident).cloned() {
             Some(id) if id == outer_pat_id => {
@@ -2755,7 +2832,7 @@ impl<'a> Resolver<'a> {
     /// A variant of `smart_resolve_path` where you also specify extra
     /// information about where the path came from; this extra info is
     /// sometimes needed for the lint that recommends rewriting
-    /// absoluate paths to `crate`, so that it knows how to frame the
+    /// absolute paths to `crate`, so that it knows how to frame the
     /// suggestion. If you are just resolving a path like `foo::bar`
     /// that appears...somewhere, though, then you just want
     /// `CrateLint::SimplePath`, which is what `smart_resolve_path`
@@ -2845,7 +2922,7 @@ impl<'a> Resolver<'a> {
                     .map(|suggestion| import_candidate_to_paths(&suggestion)).collect::<Vec<_>>();
                 enum_candidates.sort();
                 for (sp, variant_path, enum_path) in enum_candidates {
-                    if sp == DUMMY_SP {
+                    if sp.is_dummy() {
                         let msg = format!("there is an enum variant `{}`, \
                                         try using `{}`?",
                                         variant_path,
@@ -3333,14 +3410,11 @@ impl<'a> Resolver<'a> {
             if ns == TypeNS {
                 if (i == 0 && name == keywords::CrateRoot.name()) ||
                    (i == 0 && name == keywords::Crate.name()) ||
+                   (i == 0 && name == keywords::DollarCrate.name()) ||
                    (i == 1 && name == keywords::Crate.name() &&
                               path[0].name == keywords::CrateRoot.name()) {
-                    // `::a::b` or `::crate::a::b`
-                    module = Some(self.resolve_crate_root(ident.span.ctxt(), false));
-                    continue
-                } else if i == 0 && name == keywords::DollarCrate.name() {
-                    // `$crate::a::b`
-                    module = Some(self.resolve_crate_root(ident.span.ctxt(), true));
+                    // `::a::b`, `crate::a::b`, `::crate::a::b` or `$crate::a::b`
+                    module = Some(self.resolve_crate_root(ident));
                     continue
                 } else if i == 1 && !ident.is_path_segment_keyword() {
                     let prev_name = path[0].name;
@@ -3493,7 +3567,7 @@ impl<'a> Resolver<'a> {
 
         match path.get(1) {
             // If this import looks like `crate::...` it's already good
-            Some(name) if name.name == keywords::Crate.name() => return,
+            Some(ident) if ident.name == keywords::Crate.name() => return,
             // Otherwise go below to see if it's an extern crate
             Some(_) => {}
             // If the path has length one (and it's `CrateRoot` most likely)
@@ -3772,7 +3846,8 @@ impl<'a> Resolver<'a> {
             self.unused_labels.insert(id, label.ident.span);
             let def = Def::Label(id);
             self.with_label_rib(|this| {
-                this.label_ribs.last_mut().unwrap().bindings.insert(label.ident, def);
+                let ident = label.ident.modern_and_legacy();
+                this.label_ribs.last_mut().unwrap().bindings.insert(ident, def);
                 f(this);
             });
         } else {
@@ -3803,7 +3878,10 @@ impl<'a> Resolver<'a> {
             }
 
             ExprKind::Break(Some(label), _) | ExprKind::Continue(Some(label)) => {
-                match self.search_label(label.ident, |rib, id| rib.bindings.get(&id).cloned()) {
+                let def = self.search_label(label.ident, |rib, ident| {
+                    rib.bindings.get(&ident.modern_and_legacy()).cloned()
+                });
+                match def {
                     None => {
                         // Search again for close matches...
                         // Picks the first label that is "close enough", which is not necessarily
@@ -3908,6 +3986,50 @@ impl<'a> Resolver<'a> {
                 visit::walk_expr(self, expr);
                 self.current_type_ascription.pop();
             }
+            // Resolve the body of async exprs inside the async closure to which they desugar
+            ExprKind::Async(_, async_closure_id, ref block) => {
+                let rib_kind = ClosureRibKind(async_closure_id);
+                self.ribs[ValueNS].push(Rib::new(rib_kind));
+                self.label_ribs.push(Rib::new(rib_kind));
+                self.visit_block(&block);
+                self.label_ribs.pop();
+                self.ribs[ValueNS].pop();
+            }
+            // `async |x| ...` gets desugared to `|x| future_from_generator(|| ...)`, so we need to
+            // resolve the arguments within the proper scopes so that usages of them inside the
+            // closure are detected as upvars rather than normal closure arg usages.
+            ExprKind::Closure(
+                _, IsAsync::Async { closure_id: inner_closure_id, .. }, _,
+                ref fn_decl, ref body, _span,
+            ) => {
+                let rib_kind = ClosureRibKind(expr.id);
+                self.ribs[ValueNS].push(Rib::new(rib_kind));
+                self.label_ribs.push(Rib::new(rib_kind));
+                // Resolve arguments:
+                let mut bindings_list = FxHashMap();
+                for argument in &fn_decl.inputs {
+                    self.resolve_pattern(&argument.pat, PatternSource::FnParam, &mut bindings_list);
+                    self.visit_ty(&argument.ty);
+                }
+                // No need to resolve return type-- the outer closure return type is
+                // FunctionRetTy::Default
+
+                // Now resolve the inner closure
+                {
+                    let rib_kind = ClosureRibKind(inner_closure_id);
+                    self.ribs[ValueNS].push(Rib::new(rib_kind));
+                    self.label_ribs.push(Rib::new(rib_kind));
+                    // No need to resolve arguments: the inner closure has none.
+                    // Resolve the return type:
+                    visit::walk_fn_ret_ty(self, &fn_decl.output);
+                    // Resolve the body
+                    self.visit_expr(body);
+                    self.label_ribs.pop();
+                    self.ribs[ValueNS].pop();
+                }
+                self.label_ribs.pop();
+                self.ribs[ValueNS].pop();
+            }
             _ => {
                 visit::walk_expr(self, expr);
             }
@@ -3953,8 +4075,9 @@ impl<'a> Resolver<'a> {
         let mut search_module = self.current_module;
         loop {
             self.get_traits_in_module_containing_item(ident, ns, search_module, &mut found_traits);
-            search_module =
-                unwrap_or!(self.hygienic_lexical_parent(search_module, &mut ident.span), break);
+            search_module = unwrap_or!(
+                self.hygienic_lexical_parent(search_module, &mut ident.span), break
+            );
         }
 
         if let Some(prelude) = self.prelude {
@@ -4041,7 +4164,18 @@ impl<'a> Resolver<'a> {
                 if ident.name == lookup_name && ns == namespace {
                     if filter_fn(name_binding.def()) {
                         // create the path
-                        let mut segms = path_segments.clone();
+                        let mut segms = if self.session.rust_2018() && !in_module_is_extern {
+                            // crate-local absolute paths start with `crate::` in edition 2018
+                            // FIXME: may also be stabilized for Rust 2015 (Issues #45477, #44660)
+                            let mut full_segms = vec![
+                                ast::PathSegment::from_ident(keywords::Crate.ident())
+                            ];
+                            full_segms.extend(path_segments.clone());
+                            full_segms
+                        } else {
+                            path_segments.clone()
+                        };
+
                         segms.push(ast::PathSegment::from_ident(ident));
                         let path = Path {
                             span: name_binding.span,
@@ -4225,7 +4359,7 @@ impl<'a> Resolver<'a> {
             let mut err = struct_span_err!(self.session, span, E0659, "`{}` is ambiguous", name);
             err.span_note(b1.span, &msg1);
             match b2.def() {
-                Def::Macro(..) if b2.span == DUMMY_SP =>
+                Def::Macro(..) if b2.span.is_dummy() =>
                     err.note(&format!("`{}` is also a builtin macro", name)),
                 _ => err.span_note(b2.span, &msg2),
             };
@@ -4311,12 +4445,6 @@ impl<'a> Resolver<'a> {
             (TypeNS, _) => "type",
         };
 
-        let namespace = match ns {
-            ValueNS => "value",
-            MacroNS => "macro",
-            TypeNS => "type",
-        };
-
         let msg = format!("the name `{}` is defined multiple times", name);
 
         let mut err = match (old_binding.is_extern_crate(), new_binding.is_extern_crate()) {
@@ -4334,18 +4462,18 @@ impl<'a> Resolver<'a> {
 
         err.note(&format!("`{}` must be defined only once in the {} namespace of this {}",
                           name,
-                          namespace,
+                          ns.descr(),
                           container));
 
         err.span_label(span, format!("`{}` re{} here", name, new_participle));
-        if old_binding.span != DUMMY_SP {
+        if !old_binding.span.is_dummy() {
             err.span_label(self.session.codemap().def_span(old_binding.span),
                            format!("previous {} of the {} `{}` here", old_noun, old_kind, name));
         }
 
         // See https://github.com/rust-lang/rust/issues/32354
         if old_binding.is_import() || new_binding.is_import() {
-            let binding = if new_binding.is_import() && new_binding.span != DUMMY_SP {
+            let binding = if new_binding.is_import() && !new_binding.span.is_dummy() {
                 new_binding
             } else {
                 old_binding

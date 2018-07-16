@@ -23,7 +23,6 @@ use std::cmp;
 
 use num_cpus;
 use toml;
-use util::exe;
 use cache::{INTERNER, Interned};
 use flags::Flags;
 pub use flags::Subcommand;
@@ -64,7 +63,7 @@ pub struct Config {
 
     pub on_fail: Option<String>,
     pub stage: Option<u32>,
-    pub keep_stage: Option<u32>,
+    pub keep_stage: Vec<u32>,
     pub src: PathBuf,
     pub jobs: Option<u32>,
     pub cmd: Subcommand,
@@ -88,6 +87,7 @@ pub struct Config {
     pub llvm_link_jobs: Option<u32>,
 
     pub lld_enabled: bool,
+    pub llvm_tools_enabled: bool,
 
     // rust codegen options
     pub rust_optimize: bool,
@@ -105,6 +105,7 @@ pub struct Config {
     pub rust_dist_src: bool,
     pub rust_codegen_backends: Vec<Interned<String>>,
     pub rust_codegen_backends_dir: String,
+    pub rust_verify_llvm_ir: bool,
 
     pub build: Interned<String>,
     pub hosts: Vec<Interned<String>>,
@@ -125,7 +126,7 @@ pub struct Config {
     // misc
     pub low_priority: bool,
     pub channel: String,
-    pub quiet_tests: bool,
+    pub verbose_tests: bool,
     pub test_miri: bool,
     pub save_toolstates: Option<PathBuf>,
     pub print_step_timings: bool,
@@ -301,7 +302,7 @@ struct Rust {
     ignore_git: Option<bool>,
     debug: Option<bool>,
     dist_src: Option<bool>,
-    quiet_tests: Option<bool>,
+    verbose_tests: Option<bool>,
     test_miri: Option<bool>,
     incremental: Option<bool>,
     save_toolstates: Option<String>,
@@ -309,8 +310,10 @@ struct Rust {
     codegen_backends_dir: Option<String>,
     wasm_syscall: Option<bool>,
     lld: Option<bool>,
+    llvm_tools: Option<bool>,
     deny_warnings: Option<bool>,
     backtrace_on_ice: Option<bool>,
+    verify_llvm_ir: Option<bool>,
 }
 
 /// TOML representation of how each build target is configured.
@@ -365,9 +368,8 @@ impl Config {
         config.src = Config::path_from_python("SRC");
         config.out = Config::path_from_python("BUILD_DIR");
 
-        let stage0_root = config.out.join(&config.build).join("stage0/bin");
-        config.initial_rustc = stage0_root.join(exe("rustc", &config.build));
-        config.initial_cargo = stage0_root.join(exe("cargo", &config.build));
+        config.initial_rustc = Config::path_from_python("RUSTC");
+        config.initial_cargo = Config::path_from_python("CARGO");
 
         config
     }
@@ -528,7 +530,7 @@ impl Config {
             set(&mut config.backtrace, rust.backtrace);
             set(&mut config.channel, rust.channel.clone());
             set(&mut config.rust_dist_src, rust.dist_src);
-            set(&mut config.quiet_tests, rust.quiet_tests);
+            set(&mut config.verbose_tests, rust.verbose_tests);
             set(&mut config.test_miri, rust.test_miri);
             // in the case "false" is set explicitly, do not overwrite the command line args
             if let Some(true) = rust.incremental {
@@ -536,12 +538,14 @@ impl Config {
             }
             set(&mut config.wasm_syscall, rust.wasm_syscall);
             set(&mut config.lld_enabled, rust.lld);
+            set(&mut config.llvm_tools_enabled, rust.llvm_tools);
             config.rustc_parallel_queries = rust.experimental_parallel_queries.unwrap_or(false);
             config.rustc_default_linker = rust.default_linker.clone();
             config.musl_root = rust.musl_root.clone().map(PathBuf::from);
             config.save_toolstates = rust.save_toolstates.clone().map(PathBuf::from);
             set(&mut config.deny_warnings, rust.deny_warnings.or(flags.warnings));
             set(&mut config.backtrace_on_ice, rust.backtrace_on_ice);
+            set(&mut config.rust_verify_llvm_ir, rust.verify_llvm_ir);
 
             if let Some(ref backends) = rust.codegen_backends {
                 config.rust_codegen_backends = backends.iter()

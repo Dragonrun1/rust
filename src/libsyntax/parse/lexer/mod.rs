@@ -26,7 +26,7 @@ pub mod comments;
 mod tokentrees;
 mod unicode_chars;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 pub struct TokenAndSpan {
     pub tok: token::Token,
     pub sp: Span,
@@ -51,11 +51,7 @@ pub struct StringReader<'a> {
     pub ch: Option<char>,
     pub filemap: Lrc<syntax_pos::FileMap>,
     /// Stop reading src at this index.
-    end_src_index: usize,
-    /// Whether to record new-lines and multibyte chars in filemap.
-    /// This is only necessary the first time a filemap is lexed.
-    /// If part of a filemap is being re-lexed, this should be set to false.
-    save_new_lines_and_multibyte: bool,
+    pub end_src_index: usize,
     // cached:
     peek_tok: token::Token,
     peek_span: Span,
@@ -188,7 +184,6 @@ impl<'a> StringReader<'a> {
             ch: Some('\n'),
             filemap,
             end_src_index: src.len(),
-            save_new_lines_and_multibyte: true,
             // dummy values; not read
             peek_tok: token::Eof,
             peek_span: syntax_pos::DUMMY_SP,
@@ -225,7 +220,6 @@ impl<'a> StringReader<'a> {
         let mut sr = StringReader::new_raw_internal(sess, begin.fm, None);
 
         // Seek the lexer to the right byte range.
-        sr.save_new_lines_and_multibyte = false;
         sr.next_pos = span.lo();
         sr.end_src_index = sr.src_index(span.hi());
 
@@ -266,7 +260,7 @@ impl<'a> StringReader<'a> {
     /// Pushes a character to a message string for error reporting
     fn push_escaped_char_for_msg(m: &mut String, c: char) {
         match c {
-            '\u{20}'...'\u{7e}' => {
+            '\u{20}'..='\u{7e}' => {
                 // Don't escape \, ' or " for user-facing messages
                 m.push(c);
             }
@@ -457,18 +451,6 @@ impl<'a> StringReader<'a> {
         if next_src_index < self.end_src_index {
             let next_ch = char_at(&self.src, next_src_index);
             let next_ch_len = next_ch.len_utf8();
-
-            if self.ch.unwrap() == '\n' {
-                if self.save_new_lines_and_multibyte {
-                    self.filemap.next_line(self.next_pos);
-                }
-            }
-            if next_ch_len > 1 {
-                if self.save_new_lines_and_multibyte {
-                    self.filemap.record_multibyte_char(self.next_pos, next_ch_len);
-                }
-            }
-            self.filemap.record_width(self.next_pos, next_ch);
 
             self.ch = Some(next_ch);
             self.pos = self.next_pos;
@@ -779,7 +761,7 @@ impl<'a> StringReader<'a> {
                     base = 16;
                     num_digits = self.scan_digits(16, 16);
                 }
-                '0'...'9' | '_' | '.' | 'e' | 'E' => {
+                '0'..='9' | '_' | '.' | 'e' | 'E' => {
                     num_digits = self.scan_digits(10, 10) + 1;
                 }
                 _ => {
@@ -1450,6 +1432,13 @@ impl<'a> StringReader<'a> {
                 self.bump();
                 let mut hash_count: u16 = 0;
                 while self.ch_is('#') {
+                    if hash_count == 65535 {
+                        let bpos = self.next_pos;
+                        self.fatal_span_(start_bpos,
+                                         bpos,
+                                         "too many `#` symbols: raw strings may be \
+                                         delimited by up to 65535 `#` symbols").raise();
+                    }
                     self.bump();
                     hash_count += 1;
                 }
@@ -1680,6 +1669,13 @@ impl<'a> StringReader<'a> {
         self.bump();
         let mut hash_count = 0;
         while self.ch_is('#') {
+            if hash_count == 65535 {
+                let bpos = self.next_pos;
+                self.fatal_span_(start_bpos,
+                                 bpos,
+                                 "too many `#` symbols: raw byte strings may be \
+                                 delimited by up to 65535 `#` symbols").raise();
+            }
             self.bump();
             hash_count += 1;
         }
@@ -1846,7 +1842,8 @@ mod tests {
                 tok: token::Ident(id, false),
                 sp: Span::new(BytePos(21), BytePos(23), NO_EXPANSION),
             };
-            assert_eq!(tok1, tok2);
+            assert_eq!(tok1.tok, tok2.tok);
+            assert_eq!(tok1.sp, tok2.sp);
             assert_eq!(string_reader.next_token().tok, token::Whitespace);
             // the 'main' id is already read:
             assert_eq!(string_reader.pos.clone(), BytePos(28));
@@ -1856,7 +1853,8 @@ mod tests {
                 tok: mk_ident("main"),
                 sp: Span::new(BytePos(24), BytePos(28), NO_EXPANSION),
             };
-            assert_eq!(tok3, tok4);
+            assert_eq!(tok3.tok, tok4.tok);
+            assert_eq!(tok3.sp, tok4.sp);
             // the lparen is already read:
             assert_eq!(string_reader.pos.clone(), BytePos(29))
         })

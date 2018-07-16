@@ -1,30 +1,34 @@
 warning: not reporting region error due to nll
   --> $DIR/propagate-approximated-fail-no-postdom.rs:55:21
    |
-LL |             let p = x.get();
+LL |             let p = x.get(); //~ ERROR
    |                     ^^^^^^^
 
-error: free region `ReFree(DefId(0/1:20 ~ propagate_approximated_fail_no_postdom[317d]::supply[0]::{{closure}}[0]), BrAnon(1))` does not outlive free region `ReFree(DefId(0/1:20 ~ propagate_approximated_fail_no_postdom[317d]::supply[0]::{{closure}}[0]), BrAnon(2))`
-  --> $DIR/propagate-approximated-fail-no-postdom.rs:55:17
+error: unsatisfied lifetime constraints
+  --> $DIR/propagate-approximated-fail-no-postdom.rs:55:21
    |
-LL |             let p = x.get();
-   |                 ^
+LL |         |_outlives1, _outlives2, _outlives3, x, y| {
+   |          ----------              ---------- lifetime `'2` appears in this argument
+   |          |
+   |          lifetime `'1` appears in this argument
+LL |             // Only works if 'x: 'y:
+LL |             let p = x.get(); //~ ERROR
+   |                     ^^^^^^^ argument requires that `'1` must outlive `'2`
 
 note: No external requirements
   --> $DIR/propagate-approximated-fail-no-postdom.rs:53:9
    |
 LL | /         |_outlives1, _outlives2, _outlives3, x, y| {
 LL | |             // Only works if 'x: 'y:
-LL | |             let p = x.get();
+LL | |             let p = x.get(); //~ ERROR
 LL | |             //~^ WARN not reporting region error due to nll
-LL | |             //~| ERROR does not outlive free region
 LL | |             demand_y(x, y, p)
 LL | |         },
    | |_________^
    |
    = note: defining type: DefId(0/1:20 ~ propagate_approximated_fail_no_postdom[317d]::supply[0]::{{closure}}[0]) with closure substs [
                i16,
-               for<'r, 's> extern "rust-call" fn((std::cell::Cell<&'_#1r &ReLateBound(DebruijnIndex { index: 0 }, BrNamed(crate0:DefIndex(0:0), 'r)) u32>, std::cell::Cell<&'_#2r &ReLateBound(DebruijnIndex { index: 0 }, BrNamed(crate0:DefIndex(0:0), 'r)) u32>, std::cell::Cell<&ReLateBound(DebruijnIndex { index: 0 }, BrNamed(crate0:DefIndex(0:0), 's)) &'_#3r u32>, std::cell::Cell<&ReLateBound(DebruijnIndex { index: 0 }, BrNamed(crate0:DefIndex(0:0), 'r)) u32>, std::cell::Cell<&ReLateBound(DebruijnIndex { index: 0 }, BrNamed(crate0:DefIndex(0:0), 's)) u32>))
+               for<'r, 's> extern "rust-call" fn((std::cell::Cell<&'_#1r &ReLateBound(DebruijnIndex(0), BrNamed(crate0:DefIndex(0:0), 'r)) u32>, std::cell::Cell<&'_#2r &ReLateBound(DebruijnIndex(0), BrNamed(crate0:DefIndex(0:0), 'r)) u32>, std::cell::Cell<&ReLateBound(DebruijnIndex(0), BrNamed(crate0:DefIndex(0:0), 's)) &'_#3r u32>, std::cell::Cell<&ReLateBound(DebruijnIndex(0), BrNamed(crate0:DefIndex(0:0), 'r)) u32>, std::cell::Cell<&ReLateBound(DebruijnIndex(0), BrNamed(crate0:DefIndex(0:0), 's)) u32>))
            ]
 
 note: No external requirements

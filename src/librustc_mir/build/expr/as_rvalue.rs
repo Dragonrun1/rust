@@ -102,7 +102,9 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 });
                 if let Some(scope) = scope {
                     // schedule a shallow free of that memory, lest we unwind:
-                    this.schedule_drop(expr_span, scope, &Place::Local(result), value.ty);
+                    this.schedule_drop_storage_and_value(
+                        expr_span, scope, &Place::Local(result), value.ty,
+                    );
                 }
 
                 // malloc some memory of suitable type (thus far, uninitialized):
@@ -186,10 +188,29 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
             }
             ExprKind::Closure { closure_id, substs, upvars, movability } => {
                 // see (*) above
-                let mut operands: Vec<_> =
-                    upvars.into_iter()
-                          .map(|upvar| unpack!(block = this.as_operand(block, scope, upvar)))
-                          .collect();
+                let mut operands: Vec<_> = upvars
+                    .into_iter()
+                    .map(|upvar| {
+                        let upvar = this.hir.mirror(upvar);
+                        match Category::of(&upvar.kind) {
+                            // Use as_place to avoid creating a temporary when
+                            // moving a variable into a closure, so that
+                            // borrowck knows which variables to mark as being
+                            // used as mut. This is OK here because the upvar
+                            // expressions have no side effects and act on
+                            // disjoint places.
+                            // This occurs when capturing by copy/move, while
+                            // by reference captures use as_operand
+                            Some(Category::Place) => {
+                                let place = unpack!(block = this.as_place(block, upvar));
+                                this.consume_by_copy_or_move(place)
+                            }
+                            _ => {
+                                unpack!(block = this.as_operand(block, scope, upvar))
+                            }
+                        }
+                    })
+                    .collect();
                 let result = match substs {
                     UpvarSubsts::Generator(substs) => {
                         let movability = movability.unwrap();

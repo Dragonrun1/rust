@@ -271,8 +271,29 @@ pub trait Iterator {
     /// Creates an iterator starting at the same point, but stepping by
     /// the given amount at each iteration.
     ///
-    /// Note that it will always return the first element of the iterator,
+    /// Note 1: The first element of the iterator will always be returned,
     /// regardless of the step given.
+    ///
+    /// Note 2: The time at which ignored elements are pulled is not fixed.
+    /// `StepBy` behaves like the sequence `next(), nth(step-1), nth(step-1), …`,
+    /// but is also free to behave like the sequence
+    /// `advance_n_and_return_first(step), advance_n_and_return_first(step), …`
+    /// Which way is used may change for some iterators for performance reasons.
+    /// The second way will advance the iterator earlier and may consume more items.
+    ///
+    /// `advance_n_and_return_first` is the equivalent of:
+    /// ```
+    /// fn advance_n_and_return_first<I>(iter: &mut I, total_step: usize) -> Option<I::Item>
+    /// where
+    ///     I: Iterator,
+    /// {
+    ///     let next = iter.next();
+    ///     if total_step > 1 {
+    ///         iter.nth(total_step-2);
+    ///     }
+    ///     next
+    /// }
+    /// ```
     ///
     /// # Panics
     ///
@@ -1036,8 +1057,6 @@ pub trait Iterator {
     /// Basic usage:
     ///
     /// ```
-    /// #![feature(iterator_flatten)]
-    ///
     /// let data = vec![vec![1, 2, 3, 4], vec![5, 6]];
     /// let flattened = data.into_iter().flatten().collect::<Vec<u8>>();
     /// assert_eq!(flattened, &[1, 2, 3, 4, 5, 6]);
@@ -1046,8 +1065,6 @@ pub trait Iterator {
     /// Mapping and then flattening:
     ///
     /// ```
-    /// #![feature(iterator_flatten)]
-    ///
     /// let words = ["alpha", "beta", "gamma"];
     ///
     /// // chars() returns an iterator
@@ -1074,8 +1091,6 @@ pub trait Iterator {
     /// Flattening once only removes one level of nesting:
     ///
     /// ```
-    /// #![feature(iterator_flatten)]
-    ///
     /// let d3 = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]];
     ///
     /// let d2 = d3.iter().flatten().collect::<Vec<_>>();
@@ -1093,7 +1108,7 @@ pub trait Iterator {
     ///
     /// [`flat_map()`]: #method.flat_map
     #[inline]
-    #[unstable(feature = "iterator_flatten", issue = "48213")]
+    #[stable(feature = "iterator_flatten", since = "1.29")]
     fn flatten(self) -> Flatten<Self>
     where Self: Sized, Self::Item: IntoIterator {
         Flatten { inner: flatten_compat(self) }

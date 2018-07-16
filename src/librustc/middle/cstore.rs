@@ -125,7 +125,7 @@ pub enum NativeLibraryKind {
     NativeUnknown,
 }
 
-#[derive(Clone, Hash, RustcEncodable, RustcDecodable)]
+#[derive(Clone, RustcEncodable, RustcDecodable)]
 pub struct NativeLibrary {
     pub kind: NativeLibraryKind,
     pub name: Symbol,
@@ -257,7 +257,7 @@ pub trait CrateStore {
     fn metadata_encoding_version(&self) -> &[u8];
 }
 
-pub type CrateStoreDyn = CrateStore + sync::Sync;
+pub type CrateStoreDyn = dyn CrateStore + sync::Sync;
 
 // FIXME: find a better place for this?
 pub fn validate_crate_name(sess: Option<&Session>, s: &str, sp: Option<Span>) {

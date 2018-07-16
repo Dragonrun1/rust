@@ -1958,8 +1958,6 @@ representation hints.
 Erroneous code example:
 
 ```compile_fail,E0692
-#![feature(repr_transparent)]
-
 #[repr(transparent, C)] // error: incompatible representation hints
 struct Grams(f32);
 ```
@@ -1969,8 +1967,6 @@ another type, so adding more representation hints is contradictory. Remove
 either the `transparent` hint or the other hints, like this:
 
 ```
-#![feature(repr_transparent)]
-
 #[repr(transparent)]
 struct Grams(f32);
 ```
@@ -1978,8 +1974,6 @@ struct Grams(f32);
 Alternatively, move the other attributes to the contained type:
 
 ```
-#![feature(repr_transparent)]
-
 #[repr(C)]
 struct Foo {
     x: i32,
@@ -1994,8 +1988,6 @@ Note that introducing another `struct` just to have a place for the other
 attributes may have unintended side effects on the representation:
 
 ```
-#![feature(repr_transparent)]
-
 #[repr(transparent)]
 struct Grams(f32);
 
@@ -2139,5 +2131,11 @@ register_diagnostics! {
     E0657, // `impl Trait` can only capture lifetimes bound at the fn level
     E0687, // in-band lifetimes cannot be used in `fn`/`Fn` syntax
     E0688, // in-band lifetimes cannot be mixed with explicit lifetime binders
+
     E0697, // closures cannot be static
+
+    E0707, // multiple elided lifetimes used in arguments of `async fn`
+    E0708, // `async` non-`move` closures with arguments are not currently supported
+    E0709, // multiple different lifetimes used in arguments of `async fn`
+    E0710, // an unknown tool name found in scoped lint
 }

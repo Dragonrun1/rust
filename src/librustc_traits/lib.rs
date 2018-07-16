@@ -11,6 +11,8 @@
 //! New recursive solver modeled on Chalk's recursive solver. Most of
 //! the guts are broken up into modules; see the comments in those modules.
 
+#![deny(bare_trait_objects)]
+
 #![feature(crate_in_paths)]
 #![feature(crate_visibility_modifier)]
 #![feature(extern_prelude)]
@@ -33,21 +35,16 @@ mod dropck_outlives;
 mod evaluate_obligation;
 mod normalize_projection_ty;
 mod normalize_erasing_regions;
-mod util;
 pub mod lowering;
+mod type_op;
 
-use rustc::ty::maps::Providers;
+use rustc::ty::query::Providers;
 
 pub fn provide(p: &mut Providers) {
-    *p = Providers {
-        dropck_outlives: dropck_outlives::dropck_outlives,
-        adt_dtorck_constraint: dropck_outlives::adt_dtorck_constraint,
-        normalize_projection_ty: normalize_projection_ty::normalize_projection_ty,
-        normalize_ty_after_erasing_regions:
-            normalize_erasing_regions::normalize_ty_after_erasing_regions,
-        program_clauses_for: lowering::program_clauses_for,
-        program_clauses_for_env: lowering::program_clauses_for_env,
-        evaluate_obligation: evaluate_obligation::evaluate_obligation,
-        ..*p
-    };
+    dropck_outlives::provide(p);
+    evaluate_obligation::provide(p);
+    lowering::provide(p);
+    normalize_projection_ty::provide(p);
+    normalize_erasing_regions::provide(p);
+    type_op::provide(p);
 }

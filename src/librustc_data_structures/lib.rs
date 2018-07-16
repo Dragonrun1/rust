@@ -16,6 +16,8 @@
 //!
 //! This API is completely unstable and subject to change.
 
+#![deny(bare_trait_objects)]
+
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://www.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
@@ -59,7 +61,6 @@ pub mod small_vec;
 pub mod base_n;
 pub mod bitslice;
 pub mod bitvec;
-pub mod graph;
 pub mod indexed_set;
 pub mod indexed_vec;
 pub mod obligation_forest;
@@ -71,12 +72,13 @@ pub mod transitive_relation;
 pub use ena::unify;
 pub mod fx;
 pub mod tuple_slice;
-pub mod control_flow_graph;
+pub mod graph;
 pub mod flock;
 pub mod sync;
 pub mod owning_ref;
 pub mod tiny_list;
 pub mod sorted_map;
+pub mod work_queue;
 
 pub struct OnDrop<F: Fn()>(pub F);
 

@@ -29,10 +29,11 @@ use super::ModuleCodegen;
 use super::ModuleKind;
 
 use abi;
-use back::link;
+use back::{link, lto};
 use back::write::{self, OngoingCodegen, create_target_machine};
 use llvm::{ContextRef, ModuleRef, ValueRef, Vector, get_param};
 use llvm;
+use libc::c_uint;
 use metadata;
 use rustc::hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use rustc::middle::lang_items::StartFnLangItem;
@@ -41,7 +42,7 @@ use rustc::mir::mono::{Linkage, Visibility, Stats};
 use rustc::middle::cstore::{EncodedMetadata};
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc::ty::layout::{self, Align, TyLayout, LayoutOf};
-use rustc::ty::maps::Providers;
+use rustc::ty::query::Providers;
 use rustc::dep_graph::{DepNode, DepConstructor};
 use rustc::middle::cstore::{self, LinkMeta, LinkagePreference};
 use rustc::middle::exported_symbols;
@@ -56,6 +57,7 @@ use builder::{Builder, MemFlags};
 use callee;
 use common::{C_bool, C_bytes_in_context, C_i32, C_usize};
 use rustc_mir::monomorphize::collector::{self, MonoItemCollectionMode};
+use rustc_mir::monomorphize::item::DefPathBasedNames;
 use common::{self, C_struct_in_context, C_array, val_ty};
 use consts;
 use context::{self, CodegenCx};
@@ -67,16 +69,14 @@ use monomorphize::Instance;
 use monomorphize::partitioning::{self, PartitioningStrategy, CodegenUnit, CodegenUnitExt};
 use rustc_codegen_utils::symbol_names_test;
 use time_graph;
-use mono_item::{MonoItem, BaseMonoItemExt, MonoItemExt, DefPathBasedNames};
+use mono_item::{MonoItem, BaseMonoItemExt, MonoItemExt};
 use type_::Type;
 use type_of::LayoutLlvmExt;
 use rustc::util::nodemap::{FxHashMap, FxHashSet, DefIdSet};
 use CrateInfo;
 use rustc_data_structures::sync::Lrc;
-use rustc_target::spec::TargetTriple;
 
 use std::any::Any;
-use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::str;
 use std::sync::Arc;
@@ -92,7 +92,7 @@ use syntax::ast;
 
 use mir::operand::OperandValue;
 
-pub use rustc_codegen_utils::check_for_rustc_errors_attr;
+use rustc_codegen_utils::check_for_rustc_errors_attr;
 
 pub struct StatRecorder<'a, 'tcx: 'a> {
     cx: &'a CodegenCx<'a, 'tcx>,
@@ -265,8 +265,8 @@ pub fn unsize_thin_ptr<'a, 'tcx>(
             }
             let (lldata, llextra) = result.unwrap();
             // HACK(eddyb) have to bitcast pointers until LLVM removes pointee types.
-            (bx.bitcast(lldata, dst_layout.scalar_pair_element_llvm_type(bx.cx, 0)),
-             bx.bitcast(llextra, dst_layout.scalar_pair_element_llvm_type(bx.cx, 1)))
+            (bx.bitcast(lldata, dst_layout.scalar_pair_element_llvm_type(bx.cx, 0, true)),
+             bx.bitcast(llextra, dst_layout.scalar_pair_element_llvm_type(bx.cx, 1, true)))
         }
         _ => bug!("unsize_thin_ptr: called on bad types"),
     }
@@ -396,9 +396,14 @@ pub fn from_immediate(bx: &Builder, val: ValueRef) -> ValueRef {
 
 pub fn to_immediate(bx: &Builder, val: ValueRef, layout: layout::TyLayout) -> ValueRef {
     if let layout::Abi::Scalar(ref scalar) = layout.abi {
-        if scalar.is_bool() {
-            return bx.trunc(val, Type::i1(bx.cx));
-        }
+        return to_immediate_scalar(bx, val, scalar);
+    }
+    val
+}
+
+pub fn to_immediate_scalar(bx: &Builder, val: ValueRef, scalar: &layout::Scalar) -> ValueRef {
+    if scalar.is_bool() {
+        return bx.trunc(val, Type::i1(bx.cx));
     }
     val
 }
@@ -712,7 +717,7 @@ pub fn iter_globals(llmod: llvm::ModuleRef) -> ValueIter {
 }
 
 pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                             rx: mpsc::Receiver<Box<Any + Send>>)
+                             rx: mpsc::Receiver<Box<dyn Any + Send>>)
                              -> OngoingCodegen {
 
     check_for_rustc_errors_attr(tcx);
@@ -734,15 +739,18 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let link_meta = link::build_link_meta(crate_hash);
 
     // Codegen the metadata.
-    let llmod_id = "metadata";
+    let metadata_cgu_name = CodegenUnit::build_cgu_name(tcx,
+                                                        LOCAL_CRATE,
+                                                        &["crate"],
+                                                        Some("metadata")).as_str()
+                                                                         .to_string();
     let (metadata_llcx, metadata_llmod, metadata) =
         time(tcx.sess, "write metadata", || {
-            write_metadata(tcx, llmod_id, &link_meta)
+            write_metadata(tcx, &metadata_cgu_name, &link_meta)
         });
 
     let metadata_module = ModuleCodegen {
-        name: link::METADATA_MODULE_NAME.to_string(),
-        llmod_id: llmod_id.to_string(),
+        name: metadata_cgu_name,
         source: ModuleSource::Codegened(ModuleLlvm {
             llcx: metadata_llcx,
             llmod: metadata_llmod,
@@ -805,26 +813,30 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
     // Codegen an allocator shim, if any
     let allocator_module = if let Some(kind) = *tcx.sess.allocator_kind.get() {
-        unsafe {
-            let llmod_id = "allocator";
-            let (llcx, llmod) =
-                context::create_context_and_module(tcx.sess, llmod_id);
-            let modules = ModuleLlvm {
-                llmod,
-                llcx,
-                tm: create_target_machine(tcx.sess, false),
-            };
-            time(tcx.sess, "write allocator module", || {
+        let llmod_id = CodegenUnit::build_cgu_name(tcx,
+                                                   LOCAL_CRATE,
+                                                   &["crate"],
+                                                   Some("allocator")).as_str()
+                                                                     .to_string();
+        let (llcx, llmod) = unsafe {
+            context::create_context_and_module(tcx.sess, &llmod_id)
+        };
+        let modules = ModuleLlvm {
+            llmod,
+            llcx,
+            tm: create_target_machine(tcx.sess, false),
+        };
+        time(tcx.sess, "write allocator module", || {
+            unsafe {
                 allocator::codegen(tcx, &modules, kind)
-            });
+            }
+        });
 
-            Some(ModuleCodegen {
-                name: link::ALLOCATOR_MODULE_NAME.to_string(),
-                llmod_id: llmod_id.to_string(),
-                source: ModuleSource::Codegened(modules),
-                kind: ModuleKind::Allocator,
-            })
-        }
+        Some(ModuleCodegen {
+            name: llmod_id,
+            source: ModuleSource::Codegened(modules),
+            kind: ModuleKind::Allocator,
+        })
     } else {
         None
     };
@@ -867,21 +879,10 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                 // succeed it means that none of the dependencies has changed
                 // and we can safely re-use.
                 if let Some(dep_node_index) = tcx.dep_graph.try_mark_green(tcx, dep_node) {
-                    // Append ".rs" to LLVM module identifier.
-                    //
-                    // LLVM code generator emits a ".file filename" directive
-                    // for ELF backends. Value of the "filename" is set as the
-                    // LLVM module identifier.  Due to a LLVM MC bug[1], LLVM
-                    // crashes if the module identifier is same as other symbols
-                    // such as a function name in the module.
-                    // 1. http://llvm.org/bugs/show_bug.cgi?id=11479
-                    let llmod_id = format!("{}.rs", cgu.name());
-
                     let module = ModuleCodegen {
                         name: cgu.name().to_string(),
                         source: ModuleSource::Preexisting(buf),
                         kind: ModuleKind::Regular,
-                        llmod_id,
                     };
                     tcx.dep_graph.mark_loaded_from_cache(dep_node_index, true);
                     write::submit_codegened_module_to_llvm(tcx, module, 0);
@@ -1094,7 +1095,6 @@ impl CrateInfo {
             used_crates_dynamic: cstore::used_crates(tcx, LinkagePreference::RequireDynamic),
             used_crates_static: cstore::used_crates(tcx, LinkagePreference::RequireStatic),
             used_crate_source: FxHashMap(),
-            wasm_custom_sections: BTreeMap::new(),
             wasm_imports: FxHashMap(),
             lang_item_to_crate: FxHashMap(),
             missing_lang_items: FxHashMap(),
@@ -1104,16 +1104,9 @@ impl CrateInfo {
         let load_wasm_items = tcx.sess.crate_types.borrow()
             .iter()
             .any(|c| *c != config::CrateTypeRlib) &&
-            tcx.sess.opts.target_triple == TargetTriple::from_triple("wasm32-unknown-unknown");
+            tcx.sess.opts.target_triple.triple() == "wasm32-unknown-unknown";
 
         if load_wasm_items {
-            info!("attempting to load all wasm sections");
-            for &id in tcx.wasm_custom_sections(LOCAL_CRATE).iter() {
-                let (name, contents) = fetch_wasm_section(tcx, id);
-                info.wasm_custom_sections.entry(name)
-                    .or_insert(Vec::new())
-                    .extend(contents);
-            }
             info.load_wasm_imports(tcx, LOCAL_CRATE);
         }
 
@@ -1137,12 +1130,6 @@ impl CrateInfo {
                 info.is_no_builtins.insert(cnum);
             }
             if load_wasm_items {
-                for &id in tcx.wasm_custom_sections(cnum).iter() {
-                    let (name, contents) = fetch_wasm_section(tcx, id);
-                    info.wasm_custom_sections.entry(name)
-                        .or_insert(Vec::new())
-                        .extend(contents);
-                }
                 info.load_wasm_imports(tcx, cnum);
             }
             let missing = tcx.missing_lang_items(cnum);
@@ -1204,21 +1191,8 @@ fn compile_codegen_unit<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     {
         let cgu_name = cgu.name().to_string();
 
-        // Append ".rs" to LLVM module identifier.
-        //
-        // LLVM code generator emits a ".file filename" directive
-        // for ELF backends. Value of the "filename" is set as the
-        // LLVM module identifier.  Due to a LLVM MC bug[1], LLVM
-        // crashes if the module identifier is same as other symbols
-        // such as a function name in the module.
-        // 1. http://llvm.org/bugs/show_bug.cgi?id=11479
-        let llmod_id = format!("{}-{}.rs",
-                               cgu.name(),
-                               tcx.crate_disambiguator(LOCAL_CRATE)
-                                   .to_fingerprint().to_hex());
-
         // Instantiate monomorphizations without filling out definitions yet...
-        let cx = CodegenCx::new(tcx, cgu, &llmod_id);
+        let cx = CodegenCx::new(tcx, cgu);
         let module = {
             let mono_items = cx.codegen_unit
                                  .items_in_deterministic_order(cx.tcx);
@@ -1276,7 +1250,6 @@ fn compile_codegen_unit<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                 name: cgu_name,
                 source: ModuleSource::Codegened(llvm_module),
                 kind: ModuleKind::Regular,
-                llmod_id,
             }
         };
 
@@ -1379,32 +1352,63 @@ mod temp_stable_hash_impls {
     }
 }
 
-fn fetch_wasm_section(tcx: TyCtxt, id: DefId) -> (String, Vec<u8>) {
+#[allow(unused)]
+fn load_thin_lto_imports(sess: &Session) -> lto::ThinLTOImports {
+    let path = rustc_incremental::in_incr_comp_dir_sess(
+        sess,
+        lto::THIN_LTO_IMPORTS_INCR_COMP_FILE_NAME
+    );
+
+    if !path.exists() {
+        return lto::ThinLTOImports::new();
+    }
+
+    match lto::ThinLTOImports::load_from_file(&path) {
+        Ok(imports) => imports,
+        Err(e) => {
+            let msg = format!("Error while trying to load ThinLTO import data \
+                               for incremental compilation: {}", e);
+            sess.fatal(&msg)
+        }
+    }
+}
+
+pub fn define_custom_section(cx: &CodegenCx, def_id: DefId) {
     use rustc::mir::interpret::GlobalId;
-    use rustc::middle::const_val::ConstVal;
 
-    info!("loading wasm section {:?}", id);
+    assert!(cx.tcx.sess.opts.target_triple.triple().starts_with("wasm32"));
 
-    let section = tcx.get_attrs(id)
-        .iter()
-        .find(|a| a.check_name("wasm_custom_section"))
-        .expect("missing #[wasm_custom_section] attribute")
-        .value_str()
-        .expect("malformed #[wasm_custom_section] attribute");
+    info!("loading wasm section {:?}", def_id);
 
-    let instance = ty::Instance::mono(tcx, id);
+    let section = cx.tcx.codegen_fn_attrs(def_id).wasm_custom_section.unwrap();
+
+    let instance = ty::Instance::mono(cx.tcx, def_id);
     let cid = GlobalId {
         instance,
         promoted: None
     };
     let param_env = ty::ParamEnv::reveal_all();
-    let val = tcx.const_eval(param_env.and(cid)).unwrap();
+    let val = cx.tcx.const_eval(param_env.and(cid)).unwrap();
+    let alloc = cx.tcx.const_value_to_allocation(val);
 
-    let const_val = match val.val {
-        ConstVal::Value(val) => val,
-        ConstVal::Unevaluated(..) => bug!("should be evaluated"),
-    };
-
-    let alloc = tcx.const_value_to_allocation((const_val, val.ty));
-    (section.to_string(), alloc.bytes.clone())
+    unsafe {
+        let section = llvm::LLVMMDStringInContext(
+            cx.llcx,
+            section.as_str().as_ptr() as *const _,
+            section.as_str().len() as c_uint,
+        );
+        let alloc = llvm::LLVMMDStringInContext(
+            cx.llcx,
+            alloc.bytes.as_ptr() as *const _,
+            alloc.bytes.len() as c_uint,
+        );
+        let data = [section, alloc];
+        let meta = llvm::LLVMMDNodeInContext(cx.llcx, data.as_ptr(), 2);
+        llvm::LLVMAddNamedMetadataOperand(
+            cx.llmod,
+            "wasm.custom_sections\0".as_ptr() as *const _,
+            meta,
+        );
+    }
 }
+

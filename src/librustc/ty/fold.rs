@@ -39,7 +39,7 @@
 //! These methods return true to indicate that the visitor has found what it is looking for
 //! and does not need to visit anything else.
 
-use middle::const_val::ConstVal;
+use mir::interpret::ConstValue;
 use hir::def_id::DefId;
 use ty::{self, Binder, Ty, TyCtxt, TypeFlags};
 
@@ -65,7 +65,7 @@ pub trait TypeFoldable<'tcx>: fmt::Debug + Clone {
 
     /// True if `self` has any late-bound regions that are either
     /// bound by `binder` or bound by some binder outside of `binder`.
-    /// If `binder` is `ty::DebruijnIndex::INNERMOST`, this indicates whether
+    /// If `binder` is `ty::INNERMOST`, this indicates whether
     /// there are any late-bound regions that appear free.
     fn has_regions_bound_at_or_above(&self, binder: ty::DebruijnIndex) -> bool {
         self.visit_with(&mut HasEscapingRegionsVisitor { outer_index: binder })
@@ -78,7 +78,7 @@ pub trait TypeFoldable<'tcx>: fmt::Debug + Clone {
     }
 
     fn has_escaping_regions(&self) -> bool {
-        self.has_regions_bound_at_or_above(ty::DebruijnIndex::INNERMOST)
+        self.has_regions_bound_at_or_above(ty::INNERMOST)
     }
 
     fn has_type_flags(&self, flags: TypeFlags) -> bool {
@@ -135,6 +135,20 @@ pub trait TypeFoldable<'tcx>: fmt::Debug + Clone {
     /// True if there are any late-bound regions
     fn has_late_bound_regions(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_RE_LATE_BOUND)
+    }
+
+    /// A visitor that does not recurse into types, works like `fn walk_shallow` in `Ty`.
+    fn visit_tys_shallow(&self, visit: impl FnMut(Ty<'tcx>) -> bool) -> bool {
+
+        pub struct Visitor<F>(F);
+
+        impl<'tcx, F: FnMut(Ty<'tcx>) -> bool> TypeVisitor<'tcx> for Visitor<F> {
+            fn visit_ty(&mut self, ty: Ty<'tcx>) -> bool {
+                self.0(ty)
+            }
+        }
+
+        self.visit_with(&mut Visitor(visit))
     }
 }
 
@@ -239,14 +253,35 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         value.fold_with(&mut RegionFolder::new(self, skipped_regions, &mut f))
     }
 
-    pub fn for_each_free_region<T,F>(self,
-                                     value: &T,
-                                     callback: F)
-        where F: FnMut(ty::Region<'tcx>),
-              T: TypeFoldable<'tcx>,
-    {
-        value.visit_with(&mut RegionVisitor {
-            outer_index: ty::DebruijnIndex::INNERMOST,
+    /// Invoke `callback` on every region appearing free in `value`.
+    pub fn for_each_free_region(
+        self,
+        value: &impl TypeFoldable<'tcx>,
+        mut callback: impl FnMut(ty::Region<'tcx>),
+    ) {
+        self.any_free_region_meets(value, |r| {
+            callback(r);
+            false
+        });
+    }
+
+    /// True if `callback` returns true for every region appearing free in `value`.
+    pub fn all_free_regions_meet(
+        self,
+        value: &impl TypeFoldable<'tcx>,
+        mut callback: impl FnMut(ty::Region<'tcx>) -> bool,
+    ) -> bool {
+        !self.any_free_region_meets(value, |r| !callback(r))
+    }
+
+    /// True if `callback` returns true for some region appearing free in `value`.
+    pub fn any_free_region_meets(
+        self,
+        value: &impl TypeFoldable<'tcx>,
+        callback: impl FnMut(ty::Region<'tcx>) -> bool,
+    ) -> bool {
+        return value.visit_with(&mut RegionVisitor {
+            outer_index: ty::INNERMOST,
             callback
         });
 
@@ -260,7 +295,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             /// ^          ^          ^     ^
             /// |          |          |     | here, would be shifted in 1
             /// |          |          | here, would be shifted in 2
-            /// |          | here, would be INNTERMOST shifted in by 1
+            /// |          | here, would be INNERMOST shifted in by 1
             /// | here, initially, binder would be INNERMOST
             /// ```
             ///
@@ -273,25 +308,31 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         }
 
         impl<'tcx, F> TypeVisitor<'tcx> for RegionVisitor<F>
-            where F : FnMut(ty::Region<'tcx>)
+            where F: FnMut(ty::Region<'tcx>) -> bool
         {
             fn visit_binder<T: TypeFoldable<'tcx>>(&mut self, t: &Binder<T>) -> bool {
                 self.outer_index.shift_in(1);
-                t.skip_binder().visit_with(self);
+                let result = t.skip_binder().visit_with(self);
                 self.outer_index.shift_out(1);
-
-                false // keep visiting
+                result
             }
 
             fn visit_region(&mut self, r: ty::Region<'tcx>) -> bool {
                 match *r {
                     ty::ReLateBound(debruijn, _) if debruijn < self.outer_index => {
-                        /* ignore bound regions */
+                        false // ignore bound regions, keep visiting
                     }
                     _ => (self.callback)(r),
                 }
+            }
 
-                false // keep visiting
+            fn visit_ty(&mut self, ty: Ty<'tcx>) -> bool {
+                // We're only interested in types involving regions
+                if ty.flags.intersects(TypeFlags::HAS_FREE_REGIONS) {
+                    ty.super_visit_with(self)
+                } else {
+                    false // keep visiting
+                }
             }
         }
     }
@@ -333,7 +374,7 @@ impl<'a, 'gcx, 'tcx> RegionFolder<'a, 'gcx, 'tcx> {
         RegionFolder {
             tcx,
             skipped_regions,
-            current_index: ty::DebruijnIndex::INNERMOST,
+            current_index: ty::INNERMOST,
             fold_region_fn,
         }
     }
@@ -495,7 +536,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         let mut counter = 0;
         Binder::bind(self.replace_late_bound_regions(sig, |_| {
             counter += 1;
-            self.mk_region(ty::ReLateBound(ty::DebruijnIndex::INNERMOST, ty::BrAnon(counter)))
+            self.mk_region(ty::ReLateBound(ty::INNERMOST, ty::BrAnon(counter)))
         }).0)
     }
 }
@@ -507,7 +548,7 @@ impl<'a, 'gcx, 'tcx> RegionReplacer<'a, 'gcx, 'tcx> {
     {
         RegionReplacer {
             tcx,
-            current_index: ty::DebruijnIndex::INNERMOST,
+            current_index: ty::INNERMOST,
             fld_r,
             map: BTreeMap::default()
         }
@@ -542,7 +583,7 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for RegionReplacer<'a, 'gcx, 'tcx> {
                     // that region should always use the INNERMOST
                     // debruijn index. Then we adjust it to the
                     // correct depth.
-                    assert_eq!(debruijn1, ty::DebruijnIndex::INNERMOST);
+                    assert_eq!(debruijn1, ty::INNERMOST);
                     self.tcx.mk_region(ty::ReLateBound(debruijn, br))
                 } else {
                     region
@@ -671,7 +712,7 @@ impl<'tcx> TypeVisitor<'tcx> for HasTypeFlagsVisitor {
     }
 
     fn visit_const(&mut self, c: &'tcx ty::Const<'tcx>) -> bool {
-        if let ConstVal::Unevaluated(..) = c.val {
+        if let ConstValue::Unevaluated(..) = c.val {
             let projection_flags = TypeFlags::HAS_NORMALIZABLE_PROJECTION |
                 TypeFlags::HAS_PROJECTION;
             if projection_flags.intersects(self.flags) {
@@ -701,7 +742,7 @@ struct LateBoundRegionsCollector {
 impl LateBoundRegionsCollector {
     fn new(just_constrained: bool) -> Self {
         LateBoundRegionsCollector {
-            current_index: ty::DebruijnIndex::INNERMOST,
+            current_index: ty::INNERMOST,
             regions: FxHashSet(),
             just_constrained,
         }

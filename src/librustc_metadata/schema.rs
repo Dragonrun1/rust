@@ -206,7 +206,6 @@ pub struct CrateRoot {
     pub def_path_table: Lazy<hir::map::definitions::DefPathTable>,
     pub impls: LazySeq<TraitImpls>,
     pub exported_symbols: EncodedExportedSymbols,
-    pub wasm_custom_sections: LazySeq<DefIndex>,
     pub interpret_alloc_index: LazySeq<u32>,
 
     pub index: LazySeq<index::Index>,
@@ -273,6 +272,7 @@ pub struct Entry<'tcx> {
     pub variances: LazySeq<ty::Variance>,
     pub generics: Option<Lazy<ty::Generics>>,
     pub predicates: Option<Lazy<ty::GenericPredicates<'tcx>>>,
+    pub predicates_defined_on: Option<Lazy<ty::GenericPredicates<'tcx>>>,
 
     pub mir: Option<Lazy<mir::Mir<'tcx>>>,
 }
@@ -290,6 +290,7 @@ impl_stable_hash_for!(struct Entry<'tcx> {
     variances,
     generics,
     predicates,
+    predicates_defined_on,
     mir
 });
 
@@ -304,6 +305,7 @@ pub enum EntryKind<'tcx> {
     ForeignType,
     GlobalAsm,
     Type,
+    Existential,
     Enum(ReprOptions),
     Field,
     Variant(Lazy<VariantData<'tcx>>),
@@ -336,6 +338,7 @@ impl<'a, 'gcx> HashStable<StableHashingContext<'a>> for EntryKind<'gcx> {
             EntryKind::GlobalAsm        |
             EntryKind::ForeignType      |
             EntryKind::Field |
+            EntryKind::Existential |
             EntryKind::Type => {
                 // Nothing else to hash here.
             }

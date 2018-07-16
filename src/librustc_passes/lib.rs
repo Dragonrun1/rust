@@ -14,6 +14,8 @@
 //!
 //! This API is completely unstable and subject to change.
 
+#![deny(bare_trait_objects)]
+
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/")]
@@ -32,7 +34,7 @@ extern crate syntax;
 extern crate syntax_pos;
 extern crate rustc_errors as errors;
 
-use rustc::ty::maps::Providers;
+use rustc::ty::query::Providers;
 
 mod diagnostics;
 

@@ -14,7 +14,7 @@
 //! For more information about how MIR-based region-checking works,
 //! see the [rustc guide].
 //!
-//! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/mir-borrowck.html
+//! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/mir/borrowck.html
 
 use ich::{StableHashingContext, NodeIdHashingMode};
 use util::nodemap::{FxHashMap, FxHashSet};
@@ -27,7 +27,7 @@ use syntax::codemap;
 use syntax::ast;
 use syntax_pos::{Span, DUMMY_SP};
 use ty::TyCtxt;
-use ty::maps::Providers;
+use ty::query::Providers;
 
 use hir;
 use hir::def_id::DefId;
@@ -459,7 +459,7 @@ struct RegionResolutionVisitor<'a, 'tcx: 'a> {
 }
 
 struct ExprLocatorVisitor {
-    id: ast::NodeId,
+    hir_id: hir::HirId,
     result: Option<usize>,
     expr_and_pat_count: usize,
 }
@@ -476,7 +476,7 @@ impl<'tcx> Visitor<'tcx> for ExprLocatorVisitor {
 
         self.expr_and_pat_count += 1;
 
-        if pat.id == self.id {
+        if pat.hir_id == self.hir_id {
             self.result = Some(self.expr_and_pat_count);
         }
     }
@@ -494,7 +494,7 @@ impl<'tcx> Visitor<'tcx> for ExprLocatorVisitor {
                self.expr_and_pat_count,
                expr);
 
-        if expr.id == self.id {
+        if expr.hir_id == self.hir_id {
             self.result = Some(self.expr_and_pat_count);
         }
     }
@@ -778,11 +778,11 @@ impl<'tcx> ScopeTree {
     /// `scope` must be inside the body.
     pub fn yield_in_scope_for_expr(&self,
                                    scope: Scope,
-                                   expr: ast::NodeId,
+                                   expr_hir_id: hir::HirId,
                                    body: &'tcx hir::Body) -> Option<Span> {
         self.yield_in_scope(scope).and_then(|(span, count)| {
             let mut visitor = ExprLocatorVisitor {
-                id: expr,
+                hir_id: expr_hir_id,
                 result: None,
                 expr_and_pat_count: 0,
             };

@@ -15,7 +15,7 @@ use native_libs;
 use foreign_modules;
 use schema;
 
-use rustc::ty::maps::QueryConfig;
+use rustc::ty::query::QueryConfig;
 use rustc::middle::cstore::{CrateStore, DepKind,
                             MetadataLoader, LinkMeta,
                             LoadedMacro, EncodedMetadata, NativeLibraryKind};
@@ -24,7 +24,7 @@ use rustc::middle::stability::DeprecationEntry;
 use rustc::hir::def;
 use rustc::session::{CrateDisambiguator, Session};
 use rustc::ty::{self, TyCtxt};
-use rustc::ty::maps::Providers;
+use rustc::ty::query::Providers;
 use rustc::hir::def_id::{CrateNum, DefId, LOCAL_CRATE, CRATE_DEF_INDEX};
 use rustc::hir::map::{DefKey, DefPath, DefPathHash};
 use rustc::hir::map::blocks::FnLikeNode;
@@ -107,6 +107,7 @@ provide! { <'tcx> tcx, def_id, other, cdata,
         tcx.alloc_generics(cdata.get_generics(def_id.index, tcx.sess))
     }
     predicates_of => { cdata.get_predicates(def_id.index, tcx) }
+    predicates_defined_on => { cdata.get_predicates_defined_on(def_id.index, tcx) }
     super_predicates_of => { cdata.get_super_predicates(def_id.index, tcx) }
     trait_def => {
         tcx.alloc_trait_def(cdata.get_trait_def(def_id.index, tcx.sess))
@@ -265,8 +266,6 @@ provide! { <'tcx> tcx, def_id, other, cdata,
 
         Arc::new(cdata.exported_symbols(tcx))
     }
-
-    wasm_custom_sections => { Lrc::new(cdata.wasm_custom_sections()) }
 }
 
 pub fn provide<'tcx>(providers: &mut Providers<'tcx>) {
@@ -414,11 +413,11 @@ pub fn provide<'tcx>(providers: &mut Providers<'tcx>) {
 }
 
 impl CrateStore for cstore::CStore {
-    fn crate_data_as_rc_any(&self, krate: CrateNum) -> Lrc<Any> {
+    fn crate_data_as_rc_any(&self, krate: CrateNum) -> Lrc<dyn Any> {
         self.get_crate_data(krate)
     }
 
-    fn metadata_loader(&self) -> &MetadataLoader {
+    fn metadata_loader(&self) -> &dyn MetadataLoader {
         &*self.metadata_loader
     }
 
@@ -518,8 +517,11 @@ impl CrateStore for cstore::CStore {
             return LoadedMacro::ProcMacro(proc_macros[id.index.to_proc_macro_index()].1.clone());
         } else if data.name == "proc_macro" &&
                   self.get_crate_data(id.krate).item_name(id.index) == "quote" {
-            let ext = SyntaxExtension::ProcMacro(Box::new(::proc_macro::__internal::Quoter),
-                                                 data.root.edition);
+            let ext = SyntaxExtension::ProcMacro {
+                expander: Box::new(::proc_macro::__internal::Quoter),
+                allow_internal_unstable: true,
+                edition: data.root.edition,
+            };
             return LoadedMacro::ProcMacro(Lrc::new(ext));
         }
 

@@ -127,11 +127,7 @@ impl<'a, 'tcx> PlaceRef<'tcx> {
             OperandValue::Immediate(base::to_immediate(bx, llval, self.layout))
         } else if let layout::Abi::ScalarPair(ref a, ref b) = self.layout.abi {
             let load = |i, scalar: &layout::Scalar| {
-                let mut llptr = bx.struct_gep(self.llval, i as u64);
-                // Make sure to always load i1 as i8.
-                if scalar.is_bool() {
-                    llptr = bx.pointercast(llptr, Type::i8p(bx.cx));
-                }
+                let llptr = bx.struct_gep(self.llval, i as u64);
                 let load = bx.load(llptr, self.align);
                 scalar_load_metadata(load, scalar);
                 if scalar.is_bool() {
@@ -275,7 +271,11 @@ impl<'a, 'tcx> PlaceRef<'tcx> {
             layout::Variants::Single { .. } => bug!(),
             layout::Variants::Tagged { ref tag, .. } => {
                 let signed = match tag.value {
-                    layout::Int(_, signed) => signed,
+                    // We use `i1` for bytes that are always `0` or `1`,
+                    // e.g. `#[repr(i8)] enum E { A, B }`, but we can't
+                    // let LLVM interpret the `i1` as signed, because
+                    // then `i1 1` (i.e. E::B) is effectively `i8 -1`.
+                    layout::Int(_, signed) => !tag.is_bool() && signed,
                     _ => false
                 };
                 bx.intcast(lldiscr, cast_to, signed)

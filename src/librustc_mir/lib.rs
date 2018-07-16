@@ -14,6 +14,8 @@ Rust MIR: a lowered representation of Rust. Also: an experiment!
 
 */
 
+#![deny(bare_trait_objects)]
+
 #![feature(slice_patterns)]
 #![feature(slice_sort_by_cached_key)]
 #![feature(from_ref)]
@@ -33,8 +35,12 @@ Rust MIR: a lowered representation of Rust. Also: an experiment!
 #![feature(never_type)]
 #![feature(specialization)]
 #![feature(try_trait)]
+#![feature(unicode_internals)]
+
+#![recursion_limit="256"]
 
 extern crate arena;
+
 #[macro_use]
 extern crate bitflags;
 #[macro_use] extern crate log;
@@ -53,6 +59,7 @@ extern crate rustc_target;
 extern crate log_settings;
 extern crate rustc_apfloat;
 extern crate byteorder;
+extern crate core;
 
 mod diagnostics;
 
@@ -67,7 +74,7 @@ pub mod interpret;
 pub mod monomorphize;
 
 pub use hair::pattern::check_crate as matchck_crate;
-use rustc::ty::maps::Providers;
+use rustc::ty::query::Providers;
 
 pub fn provide(providers: &mut Providers) {
     borrow_check::provide(providers);

@@ -13,5 +13,5 @@
 
 fn main() {
     (|| Box::new(*(&[0][..])))();
-    //~^ ERROR `[{integer}]: std::marker::Sized` is not satisfied
+    //~^ ERROR the size for values of type
 }

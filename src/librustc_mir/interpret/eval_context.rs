@@ -1,23 +1,24 @@
 use std::fmt::Write;
+use std::hash::{Hash, Hasher};
+use std::mem;
 
 use rustc::hir::def_id::DefId;
 use rustc::hir::def::Def;
 use rustc::hir::map::definitions::DefPathData;
-use rustc::middle::const_val::ConstVal;
 use rustc::mir;
 use rustc::ty::layout::{self, Size, Align, HasDataLayout, IntegerExt, LayoutOf, TyLayout};
 use rustc::ty::subst::{Subst, Substs};
 use rustc::ty::{self, Ty, TyCtxt, TypeAndMut};
-use rustc::ty::maps::TyCtxtAt;
+use rustc::ty::query::TyCtxtAt;
+use rustc_data_structures::fx::{FxHashSet, FxHasher};
 use rustc_data_structures::indexed_vec::{IndexVec, Idx};
-use rustc::middle::const_val::FrameInfo;
-use syntax::codemap::{self, Span};
-use syntax::ast::Mutability;
 use rustc::mir::interpret::{
-    GlobalId, Value, Scalar,
+    FrameInfo, GlobalId, Value, Scalar,
     EvalResult, EvalErrorKind, Pointer, ConstValue,
 };
-use std::mem;
+
+use syntax::codemap::{self, Span};
+use syntax::ast::Mutability;
 
 use super::{Place, PlaceExtra, Memory,
             HasMemory, MemoryKind,
@@ -42,13 +43,17 @@ pub struct EvalContext<'a, 'mir, 'tcx: 'a + 'mir, M: Machine<'mir, 'tcx>> {
     /// The maximum number of stack frames allowed
     pub(crate) stack_limit: usize,
 
-    /// The maximum number of terminators that may be evaluated.
-    /// This prevents infinite loops and huge computations from freezing up const eval.
-    /// Remove once halting problem is solved.
-    pub(crate) terminators_remaining: usize,
+    /// When this value is negative, it indicates the number of interpreter
+    /// steps *until* the loop detector is enabled. When it is positive, it is
+    /// the number of steps after the detector has been enabled modulo the loop
+    /// detector period.
+    pub(crate) steps_since_detector_enabled: isize,
+
+    pub(crate) loop_detector: InfiniteLoopDetector<'a, 'mir, 'tcx, M>,
 }
 
 /// A stack frame.
+#[derive(Clone)]
 pub struct Frame<'mir, 'tcx: 'mir> {
     ////////////////////////////////////////////////////////////////////////////////
     // Function and callsite information
@@ -88,6 +93,121 @@ pub struct Frame<'mir, 'tcx: 'mir> {
 
     /// The index of the currently evaluated statement.
     pub stmt: usize,
+}
+
+impl<'mir, 'tcx: 'mir> Eq for Frame<'mir, 'tcx> {}
+
+impl<'mir, 'tcx: 'mir> PartialEq for Frame<'mir, 'tcx> {
+    fn eq(&self, other: &Self) -> bool {
+        let Frame {
+            mir: _,
+            instance,
+            span: _,
+            return_to_block,
+            return_place,
+            locals,
+            block,
+            stmt,
+        } = self;
+
+        // Some of these are constant during evaluation, but are included
+        // anyways for correctness.
+        *instance == other.instance
+            && *return_to_block == other.return_to_block
+            && *return_place == other.return_place
+            && *locals == other.locals
+            && *block == other.block
+            && *stmt == other.stmt
+    }
+}
+
+impl<'mir, 'tcx: 'mir> Hash for Frame<'mir, 'tcx> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Frame {
+            mir: _,
+            instance,
+            span: _,
+            return_to_block,
+            return_place,
+            locals,
+            block,
+            stmt,
+        } = self;
+
+        instance.hash(state);
+        return_to_block.hash(state);
+        return_place.hash(state);
+        locals.hash(state);
+        block.hash(state);
+        stmt.hash(state);
+    }
+}
+
+/// The virtual machine state during const-evaluation at a given point in time.
+type EvalSnapshot<'a, 'mir, 'tcx, M>
+    = (M, Vec<Frame<'mir, 'tcx>>, Memory<'a, 'mir, 'tcx, M>);
+
+pub(crate) struct InfiniteLoopDetector<'a, 'mir, 'tcx: 'a + 'mir, M: Machine<'mir, 'tcx>> {
+    /// The set of all `EvalSnapshot` *hashes* observed by this detector.
+    ///
+    /// When a collision occurs in this table, we store the full snapshot in
+    /// `snapshots`.
+    hashes: FxHashSet<u64>,
+
+    /// The set of all `EvalSnapshot`s observed by this detector.
+    ///
+    /// An `EvalSnapshot` will only be fully cloned once it has caused a
+    /// collision in `hashes`. As a result, the detector must observe at least
+    /// *two* full cycles of an infinite loop before it triggers.
+    snapshots: FxHashSet<EvalSnapshot<'a, 'mir, 'tcx, M>>,
+}
+
+impl<'a, 'mir, 'tcx, M> Default for InfiniteLoopDetector<'a, 'mir, 'tcx, M>
+    where M: Machine<'mir, 'tcx>,
+          'tcx: 'a + 'mir,
+{
+    fn default() -> Self {
+        InfiniteLoopDetector {
+            hashes: FxHashSet::default(),
+            snapshots: FxHashSet::default(),
+        }
+    }
+}
+
+impl<'a, 'mir, 'tcx, M> InfiniteLoopDetector<'a, 'mir, 'tcx, M>
+    where M: Machine<'mir, 'tcx>,
+          'tcx: 'a + 'mir,
+{
+    /// Returns `true` if the loop detector has not yet observed a snapshot.
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    pub fn observe_and_analyze(
+        &mut self,
+        machine: &M,
+        stack: &Vec<Frame<'mir, 'tcx>>,
+        memory: &Memory<'a, 'mir, 'tcx, M>,
+    ) -> EvalResult<'tcx, ()> {
+        let snapshot = (machine, stack, memory);
+
+        let mut fx = FxHasher::default();
+        snapshot.hash(&mut fx);
+        let hash = fx.finish();
+
+        if self.hashes.insert(hash) {
+            // No collision
+            return Ok(())
+        }
+
+        if self.snapshots.insert((machine.clone(), stack.clone(), memory.clone())) {
+            // Spurious collision or first cycle
+            return Ok(())
+        }
+
+        // Second cycle
+        Err(EvalErrorKind::InfiniteLoop.into())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -174,7 +294,7 @@ impl<'c, 'b, 'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> LayoutOf
     }
 }
 
-const MAX_TERMINATORS: usize = 1_000_000;
+const STEPS_UNTIL_DETECTOR_ENABLED: isize = 1_000_000;
 
 impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
     pub fn new(
@@ -190,16 +310,17 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M
             memory: Memory::new(tcx, memory_data),
             stack: Vec::new(),
             stack_limit: tcx.sess.const_eval_stack_frame_limit,
-            terminators_remaining: MAX_TERMINATORS,
+            loop_detector: Default::default(),
+            steps_since_detector_enabled: -STEPS_UNTIL_DETECTOR_ENABLED,
         }
     }
 
     pub(crate) fn with_fresh_body<F: FnOnce(&mut Self) -> R, R>(&mut self, f: F) -> R {
         let stack = mem::replace(&mut self.stack, Vec::new());
-        let terminators_remaining = mem::replace(&mut self.terminators_remaining, MAX_TERMINATORS);
+        let steps = mem::replace(&mut self.steps_since_detector_enabled, -STEPS_UNTIL_DETECTOR_ENABLED);
         let r = f(self);
         self.stack = stack;
-        self.terminators_remaining = terminators_remaining;
+        self.steps_since_detector_enabled = steps;
         r
     }
 
@@ -207,7 +328,7 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M
         let layout = self.layout_of(ty)?;
         assert!(!layout.is_unsized(), "cannot alloc memory for unsized type");
 
-        self.memory.allocate(layout.size, layout.align, Some(MemoryKind::Stack))
+        self.memory.allocate(layout.size, layout.align, MemoryKind::Stack)
     }
 
     pub fn memory(&self) -> &Memory<'a, 'mir, 'tcx, M> {
@@ -233,36 +354,25 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M
         Ok(Scalar::Ptr(ptr).to_value_with_len(s.len() as u64, self.tcx.tcx))
     }
 
-    pub fn const_value_to_value(
+    pub fn const_to_value(
         &mut self,
         val: ConstValue<'tcx>,
-        _ty: Ty<'tcx>,
     ) -> EvalResult<'tcx, Value> {
         match val {
-            ConstValue::ByRef(alloc, offset) => {
-                // FIXME: Allocate new AllocId for all constants inside
-                let id = self.memory.allocate_value(alloc.clone(), Some(MemoryKind::Stack))?;
-                Ok(Value::ByRef(Pointer::new(id, offset).into(), alloc.align))
-            },
-            ConstValue::ScalarPair(a, b) => Ok(Value::ScalarPair(a, b)),
-            ConstValue::Scalar(val) => Ok(Value::Scalar(val)),
-        }
-    }
-
-    pub(super) fn const_to_value(
-        &mut self,
-        const_val: &ConstVal<'tcx>,
-        ty: Ty<'tcx>
-    ) -> EvalResult<'tcx, Value> {
-        match *const_val {
-            ConstVal::Unevaluated(def_id, substs) => {
+            ConstValue::Unevaluated(def_id, substs) => {
                 let instance = self.resolve(def_id, substs)?;
                 self.read_global_as_value(GlobalId {
                     instance,
                     promoted: None,
-                }, ty)
+                })
             }
-            ConstVal::Value(val) => self.const_value_to_value(val, ty)
+            ConstValue::ByRef(alloc, offset) => {
+                // FIXME: Allocate new AllocId for all constants inside
+                let id = self.memory.allocate_value(alloc.clone(), MemoryKind::Stack)?;
+                Ok(Value::ByRef(Pointer::new(id, offset).into(), alloc.align))
+            },
+            ConstValue::ScalarPair(a, b) => Ok(Value::ScalarPair(a, b)),
+            ConstValue::Scalar(val) => Ok(Value::Scalar(val)),
         }
     }
 
@@ -280,7 +390,7 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M
             self.param_env,
             def_id,
             substs,
-        ).ok_or_else(|| EvalErrorKind::TypeckError.into()) // turn error prop into a panic to expose associated type in const issue
+        ).ok_or_else(|| EvalErrorKind::TooGeneric.into())
     }
 
     pub(super) fn type_is_sized(&self, ty: Ty<'tcx>) -> bool {
@@ -550,8 +660,6 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M
             }
 
             Aggregate(ref kind, ref operands) => {
-                self.inc_step_counter_and_check_limit(operands.len());
-
                 let (dest, active_field_index) = match **kind {
                     mir::AggregateKind::Adt(adt_def, variant_index, _, active_field_index) => {
                         self.write_discriminant_value(dest_ty, dest, variant_index)?;
@@ -591,10 +699,14 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M
 
                 let (dest, dest_align) = self.force_allocation(dest)?.to_ptr_align();
 
-                // FIXME: speed up repeat filling
-                for i in 0..length {
-                    let elem_dest = dest.ptr_offset(elem_size * i as u64, &self)?;
-                    self.write_value_to_ptr(value, elem_dest, dest_align, elem_ty)?;
+                if length > 0 {
+                    //write the first value
+                    self.write_value_to_ptr(value, dest, dest_align, elem_ty)?;
+
+                    if length > 1 {
+                        let rest = dest.ptr_offset(elem_size * 1 as u64, &self)?;
+                        self.memory.copy_repeatedly(dest, dest_align, rest, dest_align, elem_size, length - 1, false)?;
+                    }
                 }
             }
 
@@ -739,7 +851,7 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M
                                     self.param_env,
                                     def_id,
                                     substs,
-                                ).ok_or_else(|| EvalErrorKind::TypeckError.into());
+                                ).ok_or_else(|| EvalErrorKind::TooGeneric.into());
                                 let fn_ptr = self.memory.create_fn_alloc(instance?);
                                 let valty = ValTy {
                                     value: Value::Scalar(fn_ptr.into()),
@@ -849,14 +961,14 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M
                 use rustc::mir::Literal;
                 let mir::Constant { ref literal, .. } = **constant;
                 let value = match *literal {
-                    Literal::Value { ref value } => self.const_to_value(&value.val, ty)?,
+                    Literal::Value { ref value } => self.const_to_value(value.val)?,
 
                     Literal::Promoted { index } => {
                         let instance = self.frame().instance;
                         self.read_global_as_value(GlobalId {
                             instance,
                             promoted: Some(index),
-                        }, ty)?
+                        })?
                     }
                 };
 
@@ -1036,18 +1148,9 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M
         Ok(())
     }
 
-    pub fn read_global_as_value(&mut self, gid: GlobalId<'tcx>, ty: Ty<'tcx>) -> EvalResult<'tcx, Value> {
-        if self.tcx.is_static(gid.instance.def_id()).is_some() {
-            let alloc_id = self
-                .tcx
-                .alloc_map
-                .lock()
-                .intern_static(gid.instance.def_id());
-            let layout = self.layout_of(ty)?;
-            return Ok(Value::ByRef(Scalar::Ptr(alloc_id.into()), layout.align))
-        }
+    pub fn read_global_as_value(&mut self, gid: GlobalId<'tcx>) -> EvalResult<'tcx, Value> {
         let cv = self.const_eval(gid)?;
-        self.const_to_value(&cv.val, ty)
+        self.const_to_value(cv.val)
     }
 
     pub fn const_eval(&self, gid: GlobalId<'tcx>) -> EvalResult<'tcx, &'tcx ty::Const<'tcx>> {

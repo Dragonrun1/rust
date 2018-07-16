@@ -98,15 +98,15 @@ pub enum Lto {
 #[derive(Clone, PartialEq, Hash)]
 pub enum CrossLangLto {
     LinkerPlugin(PathBuf),
-    NoLink,
+    LinkerPluginAuto,
     Disabled
 }
 
 impl CrossLangLto {
-    pub fn embed_bitcode(&self) -> bool {
+    pub fn enabled(&self) -> bool {
         match *self {
             CrossLangLto::LinkerPlugin(_) |
-            CrossLangLto::NoLink => true,
+            CrossLangLto::LinkerPluginAuto => true,
             CrossLangLto::Disabled => false,
         }
     }
@@ -1020,7 +1020,7 @@ macro_rules! options {
                 let mut bool_arg = None;
                 if parse_opt_bool(&mut bool_arg, v) {
                     *slot = if bool_arg.unwrap() {
-                        CrossLangLto::NoLink
+                        CrossLangLto::LinkerPluginAuto
                     } else {
                         CrossLangLto::Disabled
                     };
@@ -1029,8 +1029,7 @@ macro_rules! options {
             }
 
             *slot = match v {
-                None |
-                Some("no-link") => CrossLangLto::NoLink,
+                None => CrossLangLto::LinkerPluginAuto,
                 Some(path) => CrossLangLto::LinkerPlugin(PathBuf::from(path)),
             };
             true
@@ -1152,8 +1151,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "gather codegen statistics"),
     asm_comments: bool = (false, parse_bool, [TRACKED],
         "generate comments into the assembly (may change behavior)"),
-    no_verify: bool = (false, parse_bool, [TRACKED],
-        "skip LLVM verification"),
+    verify_llvm_ir: bool = (false, parse_bool, [TRACKED],
+        "verify LLVM IR"),
     borrowck_stats: bool = (false, parse_bool, [UNTRACKED],
         "gather borrowck statistics"),
     no_landing_pads: bool = (false, parse_bool, [TRACKED],
@@ -1367,6 +1366,7 @@ pub fn default_configuration(sess: &Session) -> ast::CrateConfig {
     let vendor = &sess.target.target.target_vendor;
     let min_atomic_width = sess.target.target.min_atomic_width();
     let max_atomic_width = sess.target.target.max_atomic_width();
+    let atomic_cas = sess.target.target.options.atomic_cas;
 
     let mut ret = HashSet::new();
     // Target bindings.
@@ -1405,6 +1405,9 @@ pub fn default_configuration(sess: &Session) -> ast::CrateConfig {
                 ));
             }
         }
+    }
+    if atomic_cas {
+        ret.insert((Symbol::intern("target_has_atomic"), Some(Symbol::intern("cas"))));
     }
     if sess.opts.debug_assertions {
         ret.insert((Symbol::intern("debug_assertions"), None));
@@ -1747,6 +1750,29 @@ pub fn parse_cfgspecs(cfgspecs: Vec<String>) -> ast::CrateConfig {
         .collect::<ast::CrateConfig>()
 }
 
+pub fn get_cmd_lint_options(matches: &getopts::Matches,
+                            error_format: ErrorOutputType)
+                            -> (Vec<(String, lint::Level)>, bool, Option<lint::Level>) {
+    let mut lint_opts = vec![];
+    let mut describe_lints = false;
+
+    for &level in &[lint::Allow, lint::Warn, lint::Deny, lint::Forbid] {
+        for lint_name in matches.opt_strs(level.as_str()) {
+            if lint_name == "help" {
+                describe_lints = true;
+            } else {
+                lint_opts.push((lint_name.replace("-", "_"), level));
+            }
+        }
+    }
+
+    let lint_cap = matches.opt_str("cap-lints").map(|cap| {
+        lint::Level::from_str(&cap)
+            .unwrap_or_else(|| early_error(error_format, &format!("unknown lint level: `{}`", cap)))
+    });
+    (lint_opts, describe_lints, lint_cap)
+}
+
 pub fn build_session_options_and_crate_config(
     matches: &getopts::Matches,
 ) -> (Options, ast::CrateConfig) {
@@ -1787,7 +1813,7 @@ pub fn build_session_options_and_crate_config(
         early_error(
                 ErrorOutputType::default(),
                 &format!(
-                    "Edition {} is unstable an only\
+                    "Edition {} is unstable and only \
                     available for nightly builds of rustc.",
                     edition,
                 )
@@ -1824,23 +1850,7 @@ pub fn build_session_options_and_crate_config(
     let crate_types = parse_crate_types_from_list(unparsed_crate_types)
         .unwrap_or_else(|e| early_error(error_format, &e[..]));
 
-    let mut lint_opts = vec![];
-    let mut describe_lints = false;
-
-    for &level in &[lint::Allow, lint::Warn, lint::Deny, lint::Forbid] {
-        for lint_name in matches.opt_strs(level.as_str()) {
-            if lint_name == "help" {
-                describe_lints = true;
-            } else {
-                lint_opts.push((lint_name.replace("-", "_"), level));
-            }
-        }
-    }
-
-    let lint_cap = matches.opt_str("cap-lints").map(|cap| {
-        lint::Level::from_str(&cap)
-            .unwrap_or_else(|| early_error(error_format, &format!("unknown lint level: `{}`", cap)))
-    });
+    let (lint_opts, describe_lints, lint_cap) = get_cmd_lint_options(matches, error_format);
 
     let mut debugging_opts = build_debugging_options(matches, error_format);
 
@@ -1967,6 +1977,13 @@ pub fn build_session_options_and_crate_config(
         early_error(
             error_format,
             "can't perform LTO when compiling incrementally",
+        );
+    }
+
+    if debugging_opts.profile && incremental.is_some() {
+        early_error(
+            error_format,
+            "can't instrument with gcov profiling when compiling incrementally",
         );
     }
 
@@ -3097,7 +3114,7 @@ mod tests {
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
         opts = reference.clone();
-        opts.debugging_opts.no_verify = true;
+        opts.debugging_opts.verify_llvm_ir = true;
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
         opts = reference.clone();
@@ -3145,7 +3162,7 @@ mod tests {
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
         opts = reference.clone();
-        opts.debugging_opts.cross_lang_lto = CrossLangLto::NoLink;
+        opts.debugging_opts.cross_lang_lto = CrossLangLto::LinkerPluginAuto;
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
     }
 

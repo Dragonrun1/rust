@@ -8,11 +8,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use rustc_data_structures::graph;
 use cfg::*;
 use middle::region;
-use ty::{self, TyCtxt};
+use rustc_data_structures::graph::implementation as graph;
 use syntax::ptr::P;
+use ty::{self, TyCtxt};
 
 use hir::{self, PatKind};
 use hir::def_id::DefId;
@@ -335,7 +335,7 @@ impl<'a, 'tcx> CFGBuilder<'a, 'tcx> {
                 self.add_unreachable_node()
             }
 
-            hir::ExprAgain(destination) => {
+            hir::ExprContinue(destination) => {
                 let (target_scope, cont_dest) =
                     self.find_scope_edge(expr, destination, ScopeCfKind::Continue);
                 let a = self.add_ast_node(expr.hir_id.local_id, &[pred]);

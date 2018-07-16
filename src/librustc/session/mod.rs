@@ -22,10 +22,11 @@ use middle::dependency_format;
 use session::search_paths::PathKind;
 use session::config::{OutputType};
 use ty::tls;
-use util::nodemap::{FxHashSet};
+use util::nodemap::{FxHashMap, FxHashSet};
 use util::common::{duration_to_secs_str, ErrorReported};
 use util::common::ProfileQueriesMsg;
 
+use rustc_data_structures::base_n;
 use rustc_data_structures::sync::{self, Lrc, Lock, LockCell, OneThread, Once, RwLock};
 
 use syntax::ast::NodeId;
@@ -160,6 +161,9 @@ pub struct Session {
 
     /// Metadata about the allocators for the current crate being compiled
     pub has_global_allocator: Once<bool>,
+
+    /// Cap lint level specified by a driver specifically.
+    pub driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
 }
 
 pub struct PerfStats {
@@ -513,8 +517,8 @@ impl Session {
     pub fn asm_comments(&self) -> bool {
         self.opts.debugging_opts.asm_comments
     }
-    pub fn no_verify(&self) -> bool {
-        self.opts.debugging_opts.no_verify
+    pub fn verify_llvm_ir(&self) -> bool {
+        self.opts.debugging_opts.verify_llvm_ir
     }
     pub fn borrowck_stats(&self) -> bool {
         self.opts.debugging_opts.borrowck_stats
@@ -1164,6 +1168,7 @@ pub fn build_session_(
             (*GLOBAL_JOBSERVER).clone()
         },
         has_global_allocator: Once::new(),
+        driver_lint_caps: FxHashMap(),
     };
 
     sess
@@ -1178,6 +1183,14 @@ pub struct CrateDisambiguator(Fingerprint);
 impl CrateDisambiguator {
     pub fn to_fingerprint(self) -> Fingerprint {
         self.0
+    }
+}
+
+impl fmt::Display for CrateDisambiguator {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        let (a, b) = self.0.as_value();
+        let as_u128 = a as u128 | ((b as u128) << 64);
+        f.write_str(&base_n::encode(as_u128, base_n::CASE_INSENSITIVE))
     }
 }
 

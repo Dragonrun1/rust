@@ -13,6 +13,7 @@ use std::env;
 use std::iter;
 use std::path::PathBuf;
 use std::process::{Command, exit};
+use std::collections::HashSet;
 
 use Mode;
 use Compiler;
@@ -104,9 +105,13 @@ impl Step for ToolBuild {
         let is_ext_tool = self.is_ext_tool;
 
         match self.mode {
-            Mode::ToolStd => builder.ensure(compile::Std { compiler, target }),
-            Mode::ToolTest => builder.ensure(compile::Test { compiler, target }),
-            Mode::ToolRustc => builder.ensure(compile::Rustc { compiler, target }),
+            Mode::ToolRustc => {
+                builder.ensure(compile::Rustc { compiler, target })
+            }
+            Mode::ToolStd => {
+                builder.ensure(compile::Std { compiler, target })
+            }
+            Mode::ToolBootstrap => {} // uses downloaded stage0 compiler libs
             _ => panic!("unexpected Mode for tool build")
         }
 
@@ -118,8 +123,13 @@ impl Step for ToolBuild {
         let mut duplicates = Vec::new();
         let is_expected = compile::stream_cargo(builder, &mut cargo, &mut |msg| {
             // Only care about big things like the RLS/Cargo for now
-            if tool != "rls" && tool != "cargo" {
-                return
+            match tool {
+                | "rls"
+                | "cargo"
+                | "clippy-driver"
+                => {}
+
+                _ => return,
             }
             let (id, features, filenames) = match msg {
                 compile::CargoMessage::CompilerArtifact {
@@ -178,12 +188,22 @@ impl Step for ToolBuild {
                       typically means that something was recompiled because \
                       a transitive dependency has different features activated \
                       than in a previous build:\n");
+            println!("the following dependencies are duplicated although they \
+                      have the same features enabled:");
+            for (id, cur, prev) in duplicates.drain_filter(|(_, cur, prev)| cur.2 == prev.2) {
+                println!("  {}", id);
+                // same features
+                println!("    `{}` ({:?})\n    `{}` ({:?})", cur.0, cur.1, prev.0, prev.1);
+            }
+            println!("the following dependencies have different features:");
             for (id, cur, prev) in duplicates {
                 println!("  {}", id);
-                println!("    `{}` enabled features {:?} at {:?}",
-                         cur.0, cur.2, cur.1);
-                println!("    `{}` enabled features {:?} at {:?}",
-                         prev.0, prev.2, prev.1);
+                let cur_features: HashSet<_> = cur.2.into_iter().collect();
+                let prev_features: HashSet<_> = prev.2.into_iter().collect();
+                println!("    `{}` additionally enabled features {:?} at {:?}",
+                         cur.0, &cur_features - &prev_features, cur.1);
+                println!("    `{}` additionally enabled features {:?} at {:?}",
+                         prev.0, &prev_features - &cur_features, prev.1);
             }
             println!("");
             panic!("tools should not compile multiple copies of the same crate");
@@ -273,7 +293,7 @@ macro_rules! tool {
             /// Whether this tool requires LLVM to run
             pub fn uses_llvm_tools(&self) -> bool {
                 match self {
-                    $(Tool::$name => true $(&& $llvm)*,)+
+                    $(Tool::$name => false $(|| $llvm)*,)+
                 }
             }
         }
@@ -340,21 +360,18 @@ macro_rules! tool {
     }
 }
 
-// FIXME(#51459): We have only checked that RustInstaller does not require
-// the LLVM binaries when running. We should go through all tools to determine
-// if they really need LLVM binaries, and make `llvm_tools` a required argument.
 tool!(
-    Rustbook, "src/tools/rustbook", "rustbook", Mode::ToolRustc;
+    Rustbook, "src/tools/rustbook", "rustbook", Mode::ToolBootstrap;
     ErrorIndex, "src/tools/error_index_generator", "error_index_generator", Mode::ToolRustc;
-    UnstableBookGen, "src/tools/unstable-book-gen", "unstable-book-gen", Mode::ToolStd;
-    Tidy, "src/tools/tidy", "tidy", Mode::ToolStd;
-    Linkchecker, "src/tools/linkchecker", "linkchecker", Mode::ToolStd;
-    CargoTest, "src/tools/cargotest", "cargotest", Mode::ToolStd;
-    Compiletest, "src/tools/compiletest", "compiletest", Mode::ToolTest;
-    BuildManifest, "src/tools/build-manifest", "build-manifest", Mode::ToolStd;
-    RemoteTestClient, "src/tools/remote-test-client", "remote-test-client", Mode::ToolStd;
-    RustInstaller, "src/tools/rust-installer", "fabricate", Mode::ToolStd, llvm_tools = false;
-    RustdocTheme, "src/tools/rustdoc-themes", "rustdoc-themes", Mode::ToolStd;
+    UnstableBookGen, "src/tools/unstable-book-gen", "unstable-book-gen", Mode::ToolBootstrap;
+    Tidy, "src/tools/tidy", "tidy", Mode::ToolBootstrap;
+    Linkchecker, "src/tools/linkchecker", "linkchecker", Mode::ToolBootstrap;
+    CargoTest, "src/tools/cargotest", "cargotest", Mode::ToolBootstrap;
+    Compiletest, "src/tools/compiletest", "compiletest", Mode::ToolBootstrap, llvm_tools = true;
+    BuildManifest, "src/tools/build-manifest", "build-manifest", Mode::ToolBootstrap;
+    RemoteTestClient, "src/tools/remote-test-client", "remote-test-client", Mode::ToolBootstrap;
+    RustInstaller, "src/tools/rust-installer", "fabricate", Mode::ToolBootstrap;
+    RustdocTheme, "src/tools/rustdoc-themes", "rustdoc-themes", Mode::ToolBootstrap;
 );
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -567,6 +584,14 @@ macro_rules! tool_extended {
 
 tool_extended!((self, builder),
     Cargofmt, rustfmt, "src/tools/rustfmt", "cargo-fmt", {};
+    CargoClippy, clippy, "src/tools/clippy", "cargo-clippy", {
+        // Clippy depends on procedural macros (serde), which requires a full host
+        // compiler to be available, so we need to depend on that.
+        builder.ensure(compile::Rustc {
+            compiler: self.compiler,
+            target: builder.config.build,
+        });
+    };
     Clippy, clippy, "src/tools/clippy", "clippy-driver", {
         // Clippy depends on procedural macros (serde), which requires a full host
         // compiler to be available, so we need to depend on that.
@@ -577,6 +602,14 @@ tool_extended!((self, builder),
     };
     Miri, miri, "src/tools/miri", "miri", {};
     Rls, rls, "src/tools/rls", "rls", {
+        let clippy = builder.ensure(Clippy {
+            compiler: self.compiler,
+            target: self.target,
+            extra_features: Vec::new(),
+        });
+        if clippy.is_some() {
+            self.extra_features.push("clippy".to_owned());
+        }
         builder.ensure(native::Openssl {
             target: self.target,
         });
@@ -607,7 +640,11 @@ impl<'a> Builder<'a> {
     fn prepare_tool_cmd(&self, compiler: Compiler, tool: Tool, cmd: &mut Command) {
         let host = &compiler.host;
         let mut lib_paths: Vec<PathBuf> = vec![
-            PathBuf::from(&self.sysroot_libdir(compiler, compiler.host)),
+            if compiler.stage == 0 {
+                self.build.rustc_snapshot_libdir()
+            } else {
+                PathBuf::from(&self.sysroot_libdir(compiler, compiler.host))
+            },
             self.cargo_out(compiler, tool.get_mode(), *host).join("deps"),
         ];
 

@@ -13,6 +13,8 @@
 extern {
     pub static symbol: ();
 }
-static CRASH: () = symbol; //~ cannot refer to other statics by value
+static CRASH: () = symbol;
+//~^ ERROR could not evaluate static initializer
+//~| tried to read from foreign (extern) static
 
 fn main() {}

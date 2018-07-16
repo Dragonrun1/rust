@@ -22,7 +22,6 @@ fn main() {
     if cfg!(feature = "backtrace") &&
         !target.contains("cloudabi") &&
         !target.contains("emscripten") &&
-        !target.contains("fuchsia") &&
         !target.contains("msvc") &&
         !target.contains("wasm32")
     {
@@ -68,10 +67,6 @@ fn main() {
         println!("cargo:rustc-link-lib=userenv");
         println!("cargo:rustc-link-lib=shell32");
     } else if target.contains("fuchsia") {
-        // use system-provided libbacktrace
-        if cfg!(feature = "backtrace") {
-            println!("cargo:rustc-link-lib=backtrace");
-        }
         println!("cargo:rustc-link-lib=zircon");
         println!("cargo:rustc-link-lib=fdio");
     } else if target.contains("cloudabi") {
@@ -126,7 +121,8 @@ fn build_libbacktrace(target: &str) -> Result<(), ()> {
     if !target.contains("apple-ios") &&
        !target.contains("solaris") &&
        !target.contains("redox") &&
-       !target.contains("android") {
+       !target.contains("android") &&
+       !target.contains("haiku") {
         build.define("HAVE_DL_ITERATE_PHDR", "1");
     }
     build.define("_GNU_SOURCE", "1");

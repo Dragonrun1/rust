@@ -14,7 +14,7 @@ pub struct Struct;
 
 impl Struct {
     pub fn function(funs: Vec<Fn() -> ()>) {}
-    //~^ ERROR the trait bound `std::ops::Fn() + 'static: std::marker::Sized` is not satisfied
+    //~^ ERROR the size for values of type
 }
 
 fn main() {}

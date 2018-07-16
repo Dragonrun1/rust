@@ -44,7 +44,7 @@ pub struct Builder<'a> {
     pub top_stage: u32,
     pub kind: Kind,
     cache: Cache,
-    stack: RefCell<Vec<Box<Any>>>,
+    stack: RefCell<Vec<Box<dyn Any>>>,
     time_spent_on_dependencies: Cell<Duration>,
     pub paths: Vec<PathBuf>,
     graph_nodes: RefCell<HashMap<String, NodeIndex>>,
@@ -218,6 +218,12 @@ impl StepDescription {
             }
         } else {
             for path in paths {
+                // strip CurDir prefix if present
+                let path = match path.strip_prefix(".") {
+                    Ok(p) => p,
+                    Err(_) => path,
+                };
+
                 let mut attempted_run = false;
                 for (desc, should_run) in v.iter().zip(&should_runs) {
                     if let Some(suite) = should_run.is_suite_path(path) {
@@ -370,7 +376,6 @@ impl<'a> Builder<'a> {
             ),
             Kind::Test => describe!(
                 test::Tidy,
-                test::Bootstrap,
                 test::Ui,
                 test::RunPass,
                 test::CompileFail,
@@ -416,6 +421,8 @@ impl<'a> Builder<'a> {
                 test::Clippy,
                 test::RustdocJS,
                 test::RustdocTheme,
+                // Run bootstrap close to the end as it's unlikely to fail
+                test::Bootstrap,
                 // Run run-make last, since these won't pass without make on Windows
                 test::RunMake,
                 test::RustdocUi
@@ -452,6 +459,7 @@ impl<'a> Builder<'a> {
                 dist::Cargo,
                 dist::Rls,
                 dist::Rustfmt,
+                dist::LlvmTools,
                 dist::Extended,
                 dist::HashSign
             ),
@@ -761,6 +769,22 @@ impl<'a> Builder<'a> {
 
         let want_rustdoc = self.doc_tests != DocTests::No;
 
+        // We synthetically interpret a stage0 compiler used to build tools as a
+        // "raw" compiler in that it's the exact snapshot we download. Normally
+        // the stage0 build means it uses libraries build by the stage0
+        // compiler, but for tools we just use the precompiled libraries that
+        // we've downloaded
+        let use_snapshot = mode == Mode::ToolBootstrap;
+        assert!(!use_snapshot || stage == 0);
+
+        let maybe_sysroot = self.sysroot(compiler);
+        let sysroot = if use_snapshot {
+            self.rustc_snapshot_sysroot()
+        } else {
+            &maybe_sysroot
+        };
+        let libdir = sysroot.join(libdir(&compiler.host));
+
         // Customize the compiler we're running. Specify the compiler to cargo
         // as our shim and then pass it some various options used to configure
         // how the actual compiler itself is called.
@@ -776,8 +800,8 @@ impl<'a> Builder<'a> {
                 "RUSTC_DEBUG_ASSERTIONS",
                 self.config.rust_debug_assertions.to_string(),
             )
-            .env("RUSTC_SYSROOT", self.sysroot(compiler))
-            .env("RUSTC_LIBDIR", self.rustc_libdir(compiler))
+            .env("RUSTC_SYSROOT", &sysroot)
+            .env("RUSTC_LIBDIR", &libdir)
             .env("RUSTC_RPATH", self.config.rust_rpath.to_string())
             .env("RUSTDOC", self.out.join("bootstrap/debug/rustdoc"))
             .env(
@@ -801,7 +825,7 @@ impl<'a> Builder<'a> {
             cargo.env("RUSTC_ERROR_FORMAT", error_format);
         }
         if cmd != "build" && cmd != "check" && want_rustdoc {
-            cargo.env("RUSTDOC_LIBDIR", self.sysroot_libdir(compiler, self.config.build));
+            cargo.env("RUSTDOC_LIBDIR", &libdir);
         }
 
         if mode.is_tool() {
@@ -896,6 +920,10 @@ impl<'a> Builder<'a> {
 
         if self.config.backtrace_on_ice {
             cargo.env("RUSTC_BACKTRACE_ON_ICE", "1");
+        }
+
+        if self.config.rust_verify_llvm_ir {
+            cargo.env("RUSTC_VERIFY_LLVM_IR", "1");
         }
 
         cargo.env("RUSTC_VERBOSE", format!("{}", self.verbosity));

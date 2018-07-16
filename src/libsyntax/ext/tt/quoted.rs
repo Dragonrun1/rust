@@ -14,7 +14,7 @@ use feature_gate::{self, emit_feature_err, Features, GateIssue};
 use parse::{token, ParseSess};
 use print::pprust;
 use symbol::keywords;
-use syntax_pos::{BytePos, Span, DUMMY_SP};
+use syntax_pos::{BytePos, Span};
 use tokenstream;
 
 use std::iter::Peekable;
@@ -22,7 +22,7 @@ use rustc_data_structures::sync::Lrc;
 
 /// Contains the sub-token-trees of a "delimited" token tree, such as the contents of `(`. Note
 /// that the delimiter itself might be `NoDelim`.
-#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
+#[derive(Clone, PartialEq, RustcEncodable, RustcDecodable, Debug)]
 pub struct Delimited {
     pub delim: token::DelimToken,
     pub tts: Vec<TokenTree>,
@@ -41,8 +41,8 @@ impl Delimited {
 
     /// Return a `self::TokenTree` with a `Span` corresponding to the opening delimiter.
     pub fn open_tt(&self, span: Span) -> TokenTree {
-        let open_span = if span == DUMMY_SP {
-            DUMMY_SP
+        let open_span = if span.is_dummy() {
+            span
         } else {
             span.with_lo(span.lo() + BytePos(self.delim.len() as u32))
         };
@@ -51,8 +51,8 @@ impl Delimited {
 
     /// Return a `self::TokenTree` with a `Span` corresponding to the closing delimiter.
     pub fn close_tt(&self, span: Span) -> TokenTree {
-        let close_span = if span == DUMMY_SP {
-            DUMMY_SP
+        let close_span = if span.is_dummy() {
+            span
         } else {
             span.with_lo(span.hi() - BytePos(self.delim.len() as u32))
         };
@@ -60,7 +60,7 @@ impl Delimited {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
+#[derive(Clone, PartialEq, RustcEncodable, RustcDecodable, Debug)]
 pub struct SequenceRepetition {
     /// The sequence of token trees
     pub tts: Vec<TokenTree>,
@@ -74,7 +74,7 @@ pub struct SequenceRepetition {
 
 /// A Kleene-style [repetition operator](http://en.wikipedia.org/wiki/Kleene_star)
 /// for token sequences.
-#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
+#[derive(Clone, PartialEq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
 pub enum KleeneOp {
     /// Kleene star (`*`) for zero or more repetitions
     ZeroOrMore,
@@ -85,7 +85,7 @@ pub enum KleeneOp {
 
 /// Similar to `tokenstream::TokenTree`, except that `$i`, `$i:ident`, and `$(...)`
 /// are "first-class" token trees. Useful for parsing macros.
-#[derive(Debug, Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash)]
+#[derive(Debug, Clone, PartialEq, RustcEncodable, RustcDecodable)]
 pub enum TokenTree {
     Token(Span, token::Token),
     Delimited(Span, Lrc<Delimited>),

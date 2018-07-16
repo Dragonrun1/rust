@@ -14,6 +14,7 @@ use std::slice;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut, Range, RangeBounds};
 use std::fmt;
+use std::hash::Hash;
 use std::vec;
 use std::u32;
 
@@ -22,7 +23,7 @@ use rustc_serialize as serialize;
 /// Represents some newtyped `usize` wrapper.
 ///
 /// (purpose: avoid mixing indexes for different bitvector domains.)
-pub trait Idx: Copy + 'static + Eq + Debug {
+pub trait Idx: Copy + 'static + Ord + Debug + Hash {
     fn new(idx: usize) -> Self;
     fn index(self) -> usize;
 }
@@ -365,6 +366,11 @@ impl<I: Idx, T> IndexVec<I, T> {
     #[inline]
     pub fn new() -> Self {
         IndexVec { raw: Vec::new(), _marker: PhantomData }
+    }
+
+    #[inline]
+    pub fn from_raw(raw: Vec<T>) -> Self {
+        IndexVec { raw, _marker: PhantomData }
     }
 
     #[inline]

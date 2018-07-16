@@ -364,15 +364,16 @@ fn check_impl<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 }
 
 /// Checks where clauses and inline bounds that are declared on def_id.
-fn check_where_clauses<'a, 'gcx, 'fcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'gcx>,
-                                    fcx: &FnCtxt<'fcx, 'gcx, 'tcx>,
-                                    span: Span,
-                                    def_id: DefId) {
+fn check_where_clauses<'a, 'gcx, 'fcx, 'tcx>(
+    tcx: TyCtxt<'a, 'gcx, 'gcx>,
+    fcx: &FnCtxt<'fcx, 'gcx, 'tcx>,
+    span: Span,
+    def_id: DefId,
+) {
     use ty::subst::Subst;
     use rustc::ty::TypeFoldable;
 
-    let mut predicates = fcx.tcx.predicates_of(def_id);
-    let mut substituted_predicates = Vec::new();
+    let predicates = fcx.tcx.predicates_of(def_id);
 
     let generics = tcx.generics_of(def_id);
     let is_our_default = |def: &ty::GenericParamDef| {
@@ -433,7 +434,7 @@ fn check_where_clauses<'a, 'gcx, 'fcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'gcx>,
         }
     });
     // Now we build the substituted predicates.
-    for &pred in predicates.predicates.iter() {
+    let default_obligations = predicates.predicates.iter().flat_map(|&pred| {
         struct CountParams { params: FxHashSet<u32> }
         impl<'tcx> ty::fold::TypeVisitor<'tcx> for CountParams {
             fn visit_ty(&mut self, t: Ty<'tcx>) -> bool {
@@ -455,21 +456,37 @@ fn check_where_clauses<'a, 'gcx, 'fcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'gcx>,
         let substituted_pred = pred.subst(fcx.tcx, substs);
         // Don't check non-defaulted params, dependent defaults (including lifetimes)
         // or preds with multiple params.
-        if substituted_pred.references_error() || param_count.params.len() > 1
-            || has_region {
-            continue;
+        if {
+            substituted_pred.references_error() || param_count.params.len() > 1
+                || has_region
+        } {
+                None
+        } else if predicates.predicates.contains(&substituted_pred) {
+            // Avoid duplication of predicates that contain no parameters, for example.
+            None
+        } else {
+            Some(substituted_pred)
         }
-        // Avoid duplication of predicates that contain no parameters, for example.
-        if !predicates.predicates.contains(&substituted_pred) {
-            substituted_predicates.push(substituted_pred);
-        }
-    }
+    }).map(|pred| {
+        // convert each of those into an obligation. So if you have
+        // something like `struct Foo<T: Copy = String>`, we would
+        // take that predicate `T: Copy`, substitute to `String: Copy`
+        // (actually that happens in the previous `flat_map` call),
+        // and then try to prove it (in this case, we'll fail).
+        //
+        // Note the subtle difference from how we handle `predicates`
+        // below: there, we are not trying to prove those predicates
+        // to be *true* but merely *well-formed*.
+        let pred = fcx.normalize_associated_types_in(span, &pred);
+        let cause = traits::ObligationCause::new(span, fcx.body_id, traits::ItemObligation(def_id));
+        traits::Obligation::new(cause, fcx.param_env, pred)
+    });
 
-    predicates.predicates.extend(substituted_predicates);
     let predicates = predicates.instantiate_identity(fcx.tcx);
     let predicates = fcx.normalize_associated_types_in(span, &predicates);
 
-    let obligations =
+    debug!("check_where_clauses: predicates={:?}", predicates.predicates);
+    let wf_obligations =
         predicates.predicates
                     .iter()
                     .flat_map(|p| ty::wf::predicate_obligations(fcx,
@@ -478,7 +495,8 @@ fn check_where_clauses<'a, 'gcx, 'fcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'gcx>,
                                                                 p,
                                                                 span));
 
-    for obligation in obligations {
+    for obligation in wf_obligations.chain(default_obligations) {
+        debug!("next obligation cause: {:?}", obligation.cause);
         fcx.register_predicate(obligation);
     }
 }
@@ -602,8 +620,8 @@ fn check_method_receiver<'fcx, 'gcx, 'tcx>(fcx: &FnCtxt<'fcx, 'gcx, 'tcx>,
 }
 
 fn check_variances_for_type_defn<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                    item: &hir::Item,
-                                    ast_generics: &hir::Generics)
+                                           item: &hir::Item,
+                                           hir_generics: &hir::Generics)
 {
     let item_def_id = tcx.hir.local_def_id(item.id);
     let ty = tcx.type_of(item_def_id);
@@ -631,11 +649,8 @@ fn check_variances_for_type_defn<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             continue;
         }
 
-        let (span, name) = match ast_generics.params[index] {
-            hir::GenericParam::Lifetime(ref ld) => (ld.lifetime.span, ld.lifetime.name.name()),
-            hir::GenericParam::Type(ref tp) => (tp.span, tp.name),
-        };
-        report_bivariance(tcx, span, name);
+        let param = &hir_generics.params[index];
+        report_bivariance(tcx, param.span, param.name.ident().name);
     }
 }
 
@@ -663,17 +678,12 @@ fn report_bivariance<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 fn reject_shadowing_parameters(tcx: TyCtxt, def_id: DefId) {
     let generics = tcx.generics_of(def_id);
     let parent = tcx.generics_of(generics.parent.unwrap());
-    let impl_params: FxHashMap<_, _> =
-        parent.params.iter()
-                     .flat_map(|param| {
-                         match param.kind {
-                             GenericParamDefKind::Lifetime => None,
-                             GenericParamDefKind::Type {..} => Some((param.name, param.def_id)),
-                         }
-                     })
-                     .collect();
+    let impl_params: FxHashMap<_, _> = parent.params.iter().flat_map(|param| match param.kind {
+        GenericParamDefKind::Lifetime => None,
+        GenericParamDefKind::Type {..} => Some((param.name, param.def_id)),
+    }).collect();
 
-    for method_param in generics.params.iter() {
+    for method_param in &generics.params {
         match method_param.kind {
             // Shadowing is checked in resolve_lifetime.
             GenericParamDefKind::Lifetime => continue,
@@ -749,21 +759,21 @@ impl<'a, 'tcx, 'v> Visitor<'v> for CheckTypeWellFormedVisitor<'a, 'tcx> {
     fn visit_item(&mut self, i: &hir::Item) {
         debug!("visit_item: {:?}", i);
         let def_id = self.tcx.hir.local_def_id(i.id);
-        ty::maps::queries::check_item_well_formed::ensure(self.tcx, def_id);
+        ty::query::queries::check_item_well_formed::ensure(self.tcx, def_id);
         intravisit::walk_item(self, i);
     }
 
     fn visit_trait_item(&mut self, trait_item: &'v hir::TraitItem) {
         debug!("visit_trait_item: {:?}", trait_item);
         let def_id = self.tcx.hir.local_def_id(trait_item.id);
-        ty::maps::queries::check_trait_item_well_formed::ensure(self.tcx, def_id);
+        ty::query::queries::check_trait_item_well_formed::ensure(self.tcx, def_id);
         intravisit::walk_trait_item(self, trait_item)
     }
 
     fn visit_impl_item(&mut self, impl_item: &'v hir::ImplItem) {
         debug!("visit_impl_item: {:?}", impl_item);
         let def_id = self.tcx.hir.local_def_id(impl_item.id);
-        ty::maps::queries::check_impl_item_well_formed::ensure(self.tcx, def_id);
+        ty::query::queries::check_impl_item_well_formed::ensure(self.tcx, def_id);
         intravisit::walk_impl_item(self, impl_item)
     }
 }

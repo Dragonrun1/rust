@@ -36,6 +36,8 @@
 //!
 //! This API is completely unstable and subject to change.
 
+#![deny(bare_trait_objects)]
+
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/")]
@@ -49,7 +51,6 @@
 #![feature(fs_read_write)]
 #![feature(iterator_find_map)]
 #![cfg_attr(windows, feature(libc))]
-#![cfg_attr(stage0, feature(macro_lifetime_matcher))]
 #![feature(macro_vis_matcher)]
 #![feature(never_type)]
 #![feature(exhaustive_patterns)]
@@ -132,7 +133,6 @@ pub mod middle {
     pub mod allocator;
     pub mod borrowck;
     pub mod expr_use_visitor;
-    pub mod const_val;
     pub mod cstore;
     pub mod dataflow;
     pub mod dead;
@@ -164,6 +164,7 @@ pub mod util {
     pub mod ppaux;
     pub mod nodemap;
     pub mod fs;
+    pub mod time_graph;
 }
 
 // A private module so that macro-expanded idents like
